@@ -1,0 +1,13 @@
+# Run artifacts (workspaces, PDFs, agent-generated code)
+runs/
+
+# Python
+__pycache__/
+*.egg-info/
+.venv/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets
+.env

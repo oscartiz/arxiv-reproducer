@@ -1,0 +1,30 @@
+[project]
+name = "arxiv-reproducer"
+version = "0.1.0"
+description = "An AI agent that attempts to reproduce computational results from arXiv papers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Oscar Tiznado" }]
+dependencies = [
+    "anthropic>=0.92.0",
+    "httpx>=0.27",
+    "pypdf>=4.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+arxiv-repro = "arxiv_reproducer.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arxiv_reproducer"]
+
+[tool.ruff]
+line-length = 100
