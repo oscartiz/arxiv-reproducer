@@ -1,5 +1,7 @@
 # arxiv-reproducer
 
+[![CI](https://github.com/oscartiz/arxiv-reproducer/actions/workflows/ci.yml/badge.svg)](https://github.com/oscartiz/arxiv-reproducer/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **An AI agent that attempts to reproduce computational results from arXiv papers — and honestly reports how close it got.**
 
 Give it an arXiv ID. It downloads the paper, reads it, picks a quantitative result it believes can be regenerated from the method description alone, implements that method from scratch in a sandboxed Python environment, runs it, and writes a reproduction report comparing its numbers against the paper's — ending with one of three verdicts: `REPRODUCED`, `PARTIALLY REPRODUCED`, or `NOT REPRODUCED`.
