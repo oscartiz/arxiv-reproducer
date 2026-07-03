@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,8 @@ import httpx
 from rich.console import Console
 
 from .agent import run_reproduction
-from .paper import fetch_paper, parse_arxiv_id
+from .paper import PdfExtractionError, fetch_paper, parse_arxiv_id
+from .runs import new_run_dir, safe_dir_name
 from .sandbox import SANDBOX_IMAGE, check_docker, ensure_image, image_exists
 
 
@@ -77,11 +79,11 @@ def main(argv: list[str] | None = None) -> None:
         console.print(f"[red]Failed to build sandbox image:[/red]\n{stderr.strip()[-2000:]}")
         sys.exit(1)
 
-    workdir = args.runs_dir / arxiv_id.replace("/", "_")
+    base_dir = args.runs_dir / safe_dir_name(arxiv_id)
 
     console.print(f"[bold]Fetching[/bold] arXiv:{arxiv_id} ...")
     try:
-        paper = fetch_paper(arxiv_id, workdir)
+        paper = fetch_paper(arxiv_id, base_dir)
     except httpx.HTTPStatusError as exc:
         console.print(
             f"[red]arXiv returned HTTP {exc.response.status_code} for {arxiv_id} — "
@@ -91,6 +93,9 @@ def main(argv: list[str] | None = None) -> None:
     except httpx.HTTPError as exc:
         console.print(f"[red]Network error fetching {arxiv_id}: {exc}[/red]")
         sys.exit(1)
+    except PdfExtractionError as exc:
+        console.print(f"[red]{exc}[/red]")
+        sys.exit(1)
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         sys.exit(1)
@@ -98,10 +103,21 @@ def main(argv: list[str] | None = None) -> None:
     console.print(f"[bold]{paper.title}[/bold]")
     console.print(f"{', '.join(paper.authors)}\n")
 
-    console.print("[bold]Starting reproduction agent[/bold] (this can take a while)\n")
-    report = run_reproduction(paper, workdir, console)
+    # Fresh timestamped workspace per run: prior reports are never clobbered.
+    workdir = new_run_dir(base_dir)
+    shutil.copy2(paper.pdf_path, workdir / "paper.pdf")
 
-    console.print(f"\n[green]Done.[/green] Report: [bold]{report}[/bold]")
+    console.print("[bold]Starting reproduction agent[/bold] (this can take a while)\n")
+    result = run_reproduction(paper, workdir, console)
+
+    if result.status == "completed":
+        console.print(f"\n[green]Done.[/green] Report: [bold]{result.report}[/bold]")
+    else:
+        console.print(
+            f"\n[yellow]Run ended with status: {result.status}.[/yellow] "
+            f"Partial report: [bold]{result.report}[/bold]"
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

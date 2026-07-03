@@ -149,13 +149,22 @@ class FakeAnthropic:
     """Mimics anthropic.Anthropic().beta.messages.tool_runner(...)."""
 
     last_kwargs = None
+    init_kwargs = None
     messages_to_yield = []
+    raise_after_yield: Exception | None = None
 
     def __init__(self, *args, **kwargs):
+        FakeAnthropic.init_kwargs = kwargs
+
+        def runner():
+            yield from FakeAnthropic.messages_to_yield
+            if FakeAnthropic.raise_after_yield is not None:
+                raise FakeAnthropic.raise_after_yield
+
         class _Messages:
             def tool_runner(self, **kwargs):
                 FakeAnthropic.last_kwargs = kwargs
-                return iter(FakeAnthropic.messages_to_yield)
+                return runner()
 
         class _Beta:
             messages = _Messages()
@@ -167,7 +176,9 @@ class FakeAnthropic:
 def fake_agent_env(monkeypatch, tmp_path):
     """Patch out the real Anthropic client and DockerSandbox."""
     FakeAnthropic.last_kwargs = None
+    FakeAnthropic.init_kwargs = None
     FakeAnthropic.messages_to_yield = []
+    FakeAnthropic.raise_after_yield = None
     monkeypatch.setattr(agent_mod.anthropic, "Anthropic", FakeAnthropic)
     monkeypatch.setattr(agent_mod, "DockerSandbox", FakeSandbox)
     paper = Paper(
@@ -205,17 +216,61 @@ class TestRunReproduction:
         assert "Planning the reproduction." in output
         assert "write_file" in output
 
+    def test_client_uses_sdk_retries(self, fake_agent_env):
+        paper, workdir = fake_agent_env
+        run_reproduction(paper, workdir, Console(record=True, width=200))
+        assert FakeAnthropic.init_kwargs == {"max_retries": agent_mod.API_MAX_RETRIES}
+
     def test_missing_report_gets_placeholder(self, fake_agent_env):
         paper, workdir = fake_agent_env
-        report = run_reproduction(paper, workdir, Console(record=True, width=200))
-        assert report == workdir / "REPORT.md"
-        assert "missing" in report.read_text().lower()
+        result = run_reproduction(paper, workdir, Console(record=True, width=200))
+        assert result.report == workdir / "REPORT.md"
+        assert result.status == "completed"
+        assert "missing" in result.report.read_text().lower()
 
     def test_agent_written_report_is_preserved(self, fake_agent_env):
         paper, workdir = fake_agent_env
         (workdir / "REPORT.md").write_text("# Verdict: REPRODUCED")
-        report = run_reproduction(paper, workdir, Console(record=True, width=200))
-        assert report.read_text() == "# Verdict: REPRODUCED"
+        result = run_reproduction(paper, workdir, Console(record=True, width=200))
+        assert result.report.read_text() == "# Verdict: REPRODUCED"
+
+
+class TestMidRunFailure:
+    """A dying API mid-run must still leave a coherent workspace."""
+
+    def test_api_failure_yields_error_status_and_report(self, fake_agent_env):
+        import httpx
+
+        paper, workdir = fake_agent_env
+        FakeAnthropic.messages_to_yield = [_Message([_Block("text", text="working...")])]
+        FakeAnthropic.raise_after_yield = httpx.ConnectError("api unreachable")
+
+        console = Console(record=True, width=200)
+        result = run_reproduction(paper, workdir, console)
+
+        assert result.status == "error"
+        assert "api unreachable" in (result.error or "")
+        assert result.iterations == 1
+        report_text = result.report.read_text()
+        assert "error" in report_text.lower()
+        assert "api unreachable" in report_text
+        assert "aborted" in console.export_text().lower()
+
+    def test_sandbox_is_stopped_after_api_failure(self, fake_agent_env, monkeypatch):
+        import httpx
+
+        paper, workdir = fake_agent_env
+        stopped = []
+
+        class TrackingSandbox(FakeSandbox):
+            def stop(self):
+                stopped.append(self.name if hasattr(self, "name") else "sandbox")
+                super().stop()
+
+        monkeypatch.setattr(agent_mod, "DockerSandbox", TrackingSandbox)
+        FakeAnthropic.raise_after_yield = httpx.ConnectError("api unreachable")
+        run_reproduction(paper, workdir, Console(record=True, width=200))
+        assert stopped  # teardown happened despite the failure
 
 
 class TestRunCaps:
@@ -228,11 +283,13 @@ class TestRunCaps:
             _Message([_Block("text", text=f"message-{i}")]) for i in range(10)
         ]
         console = Console(record=True, width=200)
-        run_reproduction(paper, workdir, console)
+        result = run_reproduction(paper, workdir, console)
         output = console.export_text()
         assert "message-2" in output
         assert "message-3" not in output
         assert "iteration cap" in output.lower()
+        assert result.status == "iteration_cap"
+        assert result.iterations == 3
 
     def test_wall_clock_cap_stops_the_loop(self, fake_agent_env, monkeypatch):
         paper, workdir = fake_agent_env
@@ -241,8 +298,9 @@ class TestRunCaps:
             _Message([_Block("text", text=f"message-{i}")]) for i in range(5)
         ]
         console = Console(record=True, width=200)
-        run_reproduction(paper, workdir, console)
+        result = run_reproduction(paper, workdir, console)
         output = console.export_text()
         assert "message-0" in output
         assert "message-1" not in output
         assert "wall-clock cap" in output.lower()
+        assert result.status == "wall_clock_cap"
