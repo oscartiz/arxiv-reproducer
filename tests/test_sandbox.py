@@ -3,7 +3,21 @@ import subprocess
 import pytest
 
 from arxiv_reproducer import sandbox as sandbox_mod
-from arxiv_reproducer.sandbox import DockerSandbox, ExecResult, check_docker
+from arxiv_reproducer.sandbox import (
+    DEPS_DIR,
+    DockerSandbox,
+    ExecResult,
+    check_docker,
+    ensure_image,
+    validate_packages,
+)
+
+
+@pytest.fixture(autouse=True)
+def clean_registry():
+    sandbox_mod._ACTIVE_CONTAINERS.clear()
+    yield
+    sandbox_mod._ACTIVE_CONTAINERS.clear()
 
 
 @pytest.fixture
@@ -48,6 +62,43 @@ class TestLifecycle:
         # Resource limits are applied.
         assert "--memory" in argv
         assert "--cpus" in argv
+
+    def test_start_applies_isolation_hardening(self, tmp_path, fake_docker):
+        sb = DockerSandbox(tmp_path)
+        sb.start()
+        argv = docker_run_argv(fake_docker)
+
+        # The exec container must never have network access.
+        assert argv[argv.index("--network") + 1] == "none"
+        # Immutable root fs with a size-capped writable /tmp.
+        assert "--read-only" in argv
+        tmpfs = argv[argv.index("--tmpfs") + 1]
+        assert tmpfs.startswith("/tmp:") and "noexec" in tmpfs and "size=" in tmpfs
+        # Privilege reduction.
+        assert argv[argv.index("--cap-drop") + 1] == "ALL"
+        assert argv[argv.index("--security-opt") + 1] == "no-new-privileges"
+        assert argv[argv.index("--user") + 1] == "1000:1000"
+        # Fork bombs and swap thrash are capped.
+        assert "--pids-limit" in argv
+        assert "--memory-swap" in argv
+
+    def test_start_builds_image_when_missing(self, tmp_path, fake_docker):
+        def responder(cmd, kw):
+            if cmd[:3] == ["docker", "image", "inspect"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "no such image")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        fake_docker.responder = responder
+        DockerSandbox(tmp_path).start()
+        build = next(cmd for cmd, kw in fake_docker.calls if cmd[:2] == ["docker", "build"])
+        assert "-t" in build
+
+    def test_start_registers_container_for_crash_cleanup(self, tmp_path, fake_docker):
+        sb = DockerSandbox(tmp_path)
+        sb.start()
+        assert sb.name in sandbox_mod._ACTIVE_CONTAINERS
+        sb.stop()
+        assert sb.name not in sandbox_mod._ACTIVE_CONTAINERS
 
     def test_container_names_are_unique(self, tmp_path):
         names = {DockerSandbox(tmp_path).name for _ in range(20)}
@@ -116,13 +167,137 @@ class TestExec:
         assert result.exit_code == -1
         assert "timed out after 7s" in result.stderr
 
-    def test_run_python_file_and_pip_install_dispatch(self, tmp_path, fake_docker):
+    def test_run_python_file_dispatches(self, tmp_path, fake_docker):
         sb = DockerSandbox(tmp_path)
         sb.start()
         sb.run_python_file("sim.py")
         assert fake_docker.calls[-1][0][-2:] == ["python", "sim.py"]
-        sb.pip_install(["numpy", "scipy"])
-        assert fake_docker.calls[-1][0][-5:] == ["pip", "install", "--quiet", "numpy", "scipy"]
+
+
+class TestPipInstall:
+    """Installs run in an ephemeral container that HAS network, so the
+    command surface must be locked down: validated names, wheels only."""
+
+    def install_argv(self, recorder):
+        return next(
+            cmd for cmd, _ in recorder.calls if cmd[:2] == ["docker", "run"] and "pip" in cmd
+        )
+
+    def test_installer_is_ephemeral_and_wheels_only(self, tmp_path, fake_docker):
+        sb = DockerSandbox(tmp_path)
+        sb.start()
+        result = sb.pip_install(["statsmodels", "emcee==3.1.4"])
+        assert result.exit_code == 0
+
+        argv = self.install_argv(fake_docker)
+        assert "--rm" in argv
+        # The installer may reach PyPI, so it must never execute package code:
+        assert "--only-binary=:all:" in argv
+        # Installs land inside the workspace, importable via PYTHONPATH.
+        assert f"/workspace/{DEPS_DIR}" in argv[argv.index("--target") + 1]
+        # Same privilege reduction as the exec container.
+        assert argv[argv.index("--cap-drop") + 1] == "ALL"
+        assert argv[argv.index("--user") + 1] == "1000:1000"
+        # But NOT --network none — this is the sanctioned install phase.
+        assert "none" not in argv
+        assert argv[-2:] == ["statsmodels", "emcee==3.1.4"]
+        assert sb.installed_packages == ["statsmodels", "emcee==3.1.4"]
+
+    def test_failed_install_is_not_recorded(self, tmp_path, fake_docker):
+        sb = DockerSandbox(tmp_path)
+        sb.start()
+        fake_docker.responder = lambda cmd, kw: subprocess.CompletedProcess(
+            cmd, 1, "", "no matching distribution"
+        )
+        result = sb.pip_install(["nosuchpackage12345"])
+        assert result.exit_code == 1
+        assert sb.installed_packages == []
+
+    MALICIOUS = [
+        "--index-url=http://evil.example",
+        "-r/workspace/reqs.txt",
+        "git+https://github.com/evil/evil",
+        "https://evil.example/pkg.whl",
+        "numpy; import os",
+        "pkg && curl evil",
+        "../../../etc",
+        "pkg name",
+        ".",
+        "",
+    ]
+
+    @pytest.mark.parametrize("spec", MALICIOUS)
+    def test_malicious_specs_refused_before_docker_runs(self, tmp_path, fake_docker, spec):
+        sb = DockerSandbox(tmp_path)
+        sb.start()
+        calls_before = len(fake_docker.calls)
+        result = sb.pip_install([spec])
+        assert result.exit_code != 0
+        assert "Refused" in result.stderr
+        assert len(fake_docker.calls) == calls_before  # docker never invoked
+
+    def test_install_timeout_reported(self, tmp_path, fake_docker):
+        sb = DockerSandbox(tmp_path)
+        sb.start()
+
+        def time_out(cmd, kw):
+            if "pip" in cmd:
+                raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        fake_docker.responder = time_out
+        result = sb.pip_install(["numpy"])
+        assert result.exit_code == -1
+        assert "timed out" in result.stderr
+
+
+class TestValidatePackages:
+    GOOD = ["numpy", "scipy==1.11.4", "pandas>=2.0", "scikit-learn", "typing_extensions",
+            "uncertainties[arrays]", "emcee~=3.1"]
+
+    @pytest.mark.parametrize("spec", GOOD)
+    def test_accepts_plain_specs(self, spec):
+        assert validate_packages([spec]) is None
+
+    def test_rejects_empty_list(self):
+        assert validate_packages([]) is not None
+
+
+class TestEnsureImage:
+    def test_present_image_is_not_rebuilt(self, fake_docker):
+        ensure_image("some-image:latest")
+        assert not any(cmd[:2] == ["docker", "build"] for cmd, _ in fake_docker.calls)
+
+    def test_missing_image_is_built_from_packaged_dockerfile(self, fake_docker):
+        def responder(cmd, kw):
+            if cmd[:3] == ["docker", "image", "inspect"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        fake_docker.responder = responder
+        ensure_image("some-image:latest")
+        build_call = next(
+            (cmd, kw) for cmd, kw in fake_docker.calls if cmd[:2] == ["docker", "build"]
+        )
+        assert b"FROM python" in build_call[1]["input"]
+
+
+class TestCrashCleanup:
+    def test_cleanup_all_removes_every_registered_container(self, fake_docker):
+        sandbox_mod._ACTIVE_CONTAINERS.update({"c1", "c2"})
+        sandbox_mod._cleanup_all_containers()
+        removed = {cmd[3] for cmd, _ in fake_docker.calls if cmd[:3] == ["docker", "rm", "-f"]}
+        assert removed == {"c1", "c2"}
+        assert sandbox_mod._ACTIVE_CONTAINERS == set()
+
+    def test_hooks_install_only_once(self, monkeypatch):
+        monkeypatch.setattr(sandbox_mod, "_HOOKS_INSTALLED", False)
+        registered = []
+        monkeypatch.setattr(sandbox_mod.atexit, "register", registered.append)
+        monkeypatch.setattr(sandbox_mod.signal, "signal", lambda *a: None)
+        sandbox_mod._install_cleanup_hooks()
+        sandbox_mod._install_cleanup_hooks()
+        assert registered == [sandbox_mod._cleanup_all_containers]
 
 
 class TestExecResult:
@@ -170,15 +345,15 @@ class TestCheckDocker:
 
 @pytest.mark.docker
 class TestRealDocker:
-    """Opt-in integration tests: pytest --run-docker."""
+    """Opt-in integration tests: pytest --run-docker (builds the image on first use)."""
 
     def test_container_roundtrip_and_teardown(self, tmp_path):
         sb = DockerSandbox(tmp_path)
         with sb:
-            (tmp_path / "hello.py").write_text("print('hi from sandbox')")
+            (tmp_path / "hello.py").write_text("import numpy\nprint('numpy', numpy.__version__)")
             result = sb.run_python_file("hello.py")
             assert result.exit_code == 0
-            assert "hi from sandbox" in result.stdout
+            assert "numpy" in result.stdout  # scientific stack is pre-baked
 
         leftovers = subprocess.run(
             ["docker", "ps", "-a", "--filter", f"name={sb.name}", "-q"],
@@ -186,3 +361,27 @@ class TestRealDocker:
             text=True,
         )
         assert leftovers.stdout.strip() == ""
+
+    def test_no_network_inside_sandbox(self, tmp_path):
+        with DockerSandbox(tmp_path) as sb:
+            (tmp_path / "phone_home.py").write_text(
+                "import urllib.request\n"
+                "urllib.request.urlopen('https://example.com', timeout=5)\n"
+            )
+            result = sb.run_python_file("phone_home.py")
+            assert result.exit_code != 0
+
+    def test_runs_as_non_root_with_read_only_rootfs(self, tmp_path):
+        with DockerSandbox(tmp_path) as sb:
+            uid = sb.exec(["python", "-c", "import os; print(os.getuid())"])
+            assert uid.stdout.strip() == "1000"
+            poke = sb.exec(["python", "-c", "open('/etc/pwned', 'w')"])
+            assert poke.exit_code != 0
+
+    def test_two_phase_install_then_import_offline(self, tmp_path):
+        with DockerSandbox(tmp_path) as sb:
+            install = sb.pip_install(["six"])
+            assert install.exit_code == 0, install.stderr
+            result = sb.exec(["python", "-c", "import six; print(six.__version__)"])
+            assert result.exit_code == 0, result.stderr
+            assert result.stdout.strip()

@@ -216,3 +216,33 @@ class TestRunReproduction:
         (workdir / "REPORT.md").write_text("# Verdict: REPRODUCED")
         report = run_reproduction(paper, workdir, Console(record=True, width=200))
         assert report.read_text() == "# Verdict: REPRODUCED"
+
+
+class TestRunCaps:
+    """A run must not loop forever burning API spend."""
+
+    def test_iteration_cap_stops_the_loop(self, fake_agent_env, monkeypatch):
+        paper, workdir = fake_agent_env
+        monkeypatch.setattr(agent_mod, "MAX_ITERATIONS", 3)
+        FakeAnthropic.messages_to_yield = [
+            _Message([_Block("text", text=f"message-{i}")]) for i in range(10)
+        ]
+        console = Console(record=True, width=200)
+        run_reproduction(paper, workdir, console)
+        output = console.export_text()
+        assert "message-2" in output
+        assert "message-3" not in output
+        assert "iteration cap" in output.lower()
+
+    def test_wall_clock_cap_stops_the_loop(self, fake_agent_env, monkeypatch):
+        paper, workdir = fake_agent_env
+        monkeypatch.setattr(agent_mod, "MAX_WALL_CLOCK_SECONDS", 0)
+        FakeAnthropic.messages_to_yield = [
+            _Message([_Block("text", text=f"message-{i}")]) for i in range(5)
+        ]
+        console = Console(record=True, width=200)
+        run_reproduction(paper, workdir, console)
+        output = console.export_text()
+        assert "message-0" in output
+        assert "message-1" not in output
+        assert "wall-clock cap" in output.lower()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from rich.console import Console
 
 from .agent import run_reproduction
 from .paper import fetch_paper, parse_arxiv_id
-from .sandbox import check_docker
+from .sandbox import SANDBOX_IMAGE, check_docker, ensure_image, image_exists
 
 
 def has_anthropic_credentials() -> bool:
@@ -63,6 +64,18 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         sys.exit(2)
+
+    if not image_exists(SANDBOX_IMAGE):
+        console.print(
+            f"[bold]Building sandbox image[/bold] {SANDBOX_IMAGE} "
+            "(first run only — this takes a few minutes) ..."
+        )
+    try:
+        ensure_image(SANDBOX_IMAGE)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        console.print(f"[red]Failed to build sandbox image:[/red]\n{stderr.strip()[-2000:]}")
+        sys.exit(1)
 
     workdir = args.runs_dir / arxiv_id.replace("/", "_")
 

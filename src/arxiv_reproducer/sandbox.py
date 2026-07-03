@@ -1,20 +1,55 @@
 """Docker-based sandbox for executing agent-generated code.
 
-Each run gets a long-lived container with the run's workspace mounted at
-/workspace, so pip installs and intermediate files persist across tool calls
-within a run but never touch the host Python environment.
+The sandbox is the trust boundary of this tool: papers are untrusted input,
+and the code the agent writes under their influence is untrusted output. All
+execution happens in a long-lived container with:
+
+- no network (``--network none``) — the scientific stack is pre-baked into
+  the image at build time, so run-time code cannot exfiltrate or phone home;
+- a read-only root filesystem, writable only at the bind-mounted /workspace
+  (kept on the host for auditability) and a size-capped /tmp tmpfs;
+- all capabilities dropped, no-new-privileges, a non-root user, and memory /
+  CPU / pid limits.
+
+Package installs run in a separate ephemeral container that does have
+network but only ever executes a validated ``pip install --only-binary``
+into /workspace/.deps — agent code never runs with network access.
 """
 
 from __future__ import annotations
 
+import atexit
+import re
 import shutil
+import signal
 import subprocess
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
 
-DEFAULT_IMAGE = "python:3.12-slim"
+SANDBOX_IMAGE = "arxiv-repro-sandbox:latest"
 EXEC_TIMEOUT = 600  # seconds per command
+INSTALL_TIMEOUT = 300  # seconds per pip install
+
+MEMORY_LIMIT = "4g"
+CPU_LIMIT = "2"
+PIDS_LIMIT = "256"
+TMP_SIZE = "512m"
+DEPS_DIR = ".deps"  # inside /workspace; importable via PYTHONPATH
+
+# PEP 508-ish subset: name, optional extras, optional version pin. No flags,
+# URLs, paths, or spaces — anything else is refused before docker is invoked.
+_PACKAGE_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+    r"(?:\[[A-Za-z0-9,._-]+\])?"
+    r"(?:(?:==|>=|<=|~=|!=)[A-Za-z0-9.*+!_-]+)?$"
+)
+
+# Containers that exist right now; emptied by stop()/atexit/SIGTERM so a
+# crash or kill never leaks a running container.
+_ACTIVE_CONTAINERS: set[str] = set()
+_HOOKS_INSTALLED = False
 
 
 def check_docker() -> str | None:
@@ -25,6 +60,75 @@ def check_docker() -> str | None:
     if probe.returncode != 0:
         return "Docker daemon is not running — start Docker and try again."
     return None
+
+
+def sandbox_dockerfile() -> str:
+    """The Dockerfile for the pre-baked sandbox image (shipped as package data)."""
+    return resources.files("arxiv_reproducer").joinpath("docker/sandbox.Dockerfile").read_text()
+
+
+def image_exists(image: str = SANDBOX_IMAGE) -> bool:
+    probe = subprocess.run(["docker", "image", "inspect", image], capture_output=True)
+    return probe.returncode == 0
+
+
+def ensure_image(image: str = SANDBOX_IMAGE) -> None:
+    """Build the sandbox image from the packaged Dockerfile if it is missing."""
+    if image_exists(image):
+        return
+    subprocess.run(
+        ["docker", "build", "-t", image, "-"],
+        input=sandbox_dockerfile().encode(),
+        check=True,
+        capture_output=True,
+    )
+
+
+def validate_packages(packages: list[str]) -> str | None:
+    """Return None if every entry is a plain package spec, else the problem."""
+    if not packages:
+        return "no packages given"
+    for pkg in packages:
+        if not _PACKAGE_RE.match(pkg):
+            return f"invalid package spec: {pkg!r} (plain PyPI names with optional == pins only)"
+    return None
+
+
+def _remove_container(name: str) -> None:
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+def _cleanup_all_containers() -> None:
+    for name in list(_ACTIVE_CONTAINERS):
+        _remove_container(name)
+        _ACTIVE_CONTAINERS.discard(name)
+
+
+def _install_cleanup_hooks() -> None:
+    """Ensure containers die with the process: atexit + SIGTERM.
+
+    SIGINT needs no handler — KeyboardInterrupt unwinds the context manager.
+    """
+    global _HOOKS_INSTALLED
+    if _HOOKS_INSTALLED:
+        return
+    _HOOKS_INSTALLED = True
+    atexit.register(_cleanup_all_containers)
+
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def on_sigterm(signum, frame):
+        _cleanup_all_containers()
+        if callable(previous):
+            previous(signum, frame)
+        else:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.raise_signal(signal.SIGTERM)
+
+    try:
+        signal.signal(signal.SIGTERM, on_sigterm)
+    except ValueError:
+        pass  # not in the main thread; atexit still covers us
 
 
 @dataclass
@@ -41,23 +145,47 @@ class ExecResult:
         return out
 
 
+@dataclass
 class DockerSandbox:
-    def __init__(self, workdir: Path, image: str = DEFAULT_IMAGE):
-        self.workdir = workdir.resolve()
-        self.image = image
-        self.name = f"arxiv-repro-{uuid.uuid4().hex[:12]}"
-        self._started = False
+    workdir: Path
+    image: str = SANDBOX_IMAGE
+    name: str = field(default_factory=lambda: f"arxiv-repro-{uuid.uuid4().hex[:12]}")
+    installed_packages: list[str] = field(default_factory=list)
+    _started: bool = field(default=False, repr=False)
+
+    def __post_init__(self):
+        self.workdir = Path(self.workdir).resolve()
+
+    def _hardening_flags(self) -> list[str]:
+        """Flags shared by the exec container and the ephemeral installer."""
+        return [
+            "--memory", MEMORY_LIMIT,
+            "--memory-swap", MEMORY_LIMIT,  # equal to --memory: no swap
+            "--cpus", CPU_LIMIT,
+            "--pids-limit", PIDS_LIMIT,
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--user", "1000:1000",
+            "--read-only",
+            "--tmpfs", f"/tmp:rw,noexec,nosuid,size={TMP_SIZE}",
+            "-e", "HOME=/tmp",
+            "-e", "MPLBACKEND=Agg",
+            "-e", "MPLCONFIGDIR=/tmp/mpl",
+            "-e", f"PYTHONPATH=/workspace/{DEPS_DIR}",
+            "-v", f"{self.workdir}:/workspace",
+            "-w", "/workspace",
+        ]
 
     def start(self) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
+        ensure_image(self.image)
+        _install_cleanup_hooks()
         subprocess.run(
             [
                 "docker", "run", "-d",
                 "--name", self.name,
-                "--memory", "4g",
-                "--cpus", "2",
-                "-v", f"{self.workdir}:/workspace",
-                "-w", "/workspace",
+                "--network", "none",
+                *self._hardening_flags(),
                 self.image,
                 "sleep", "infinity",
             ],
@@ -65,6 +193,7 @@ class DockerSandbox:
             capture_output=True,
         )
         self._started = True
+        _ACTIVE_CONTAINERS.add(self.name)
 
     def exec(self, command: list[str], timeout: int = EXEC_TIMEOUT) -> ExecResult:
         if not self._started:
@@ -84,11 +213,42 @@ class DockerSandbox:
         return self.exec(["python", relpath], timeout=timeout)
 
     def pip_install(self, packages: list[str]) -> ExecResult:
-        return self.exec(["pip", "install", "--quiet", *packages])
+        """Install wheels into /workspace/.deps via an ephemeral networked container.
+
+        The exec container never gets network; this one gets network but only
+        ever runs a validated pip command. --only-binary means no sdist
+        setup.py ever executes with network access.
+        """
+        problem = validate_packages(packages)
+        if problem is not None:
+            return ExecResult(2, "", f"Refused: {problem}")
+        try:
+            proc = subprocess.run(
+                [
+                    "docker", "run", "--rm",
+                    *self._hardening_flags(),
+                    self.image,
+                    "pip", "install",
+                    "--quiet",
+                    "--no-cache-dir",
+                    "--only-binary=:all:",
+                    "--target", f"/workspace/{DEPS_DIR}",
+                    *packages,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=INSTALL_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return ExecResult(-1, "", f"pip install timed out after {INSTALL_TIMEOUT}s")
+        if proc.returncode == 0:
+            self.installed_packages.extend(packages)
+        return ExecResult(proc.returncode, proc.stdout, proc.stderr)
 
     def stop(self) -> None:
         if self._started:
-            subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
+            _remove_container(self.name)
+            _ACTIVE_CONTAINERS.discard(self.name)
             self._started = False
 
     def __enter__(self) -> "DockerSandbox":
