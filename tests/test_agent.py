@@ -15,6 +15,7 @@ class FakeSandbox:
     def __init__(self, workdir):
         self.workdir = Path(workdir).resolve()
         self.calls = []
+        self.installed_packages = []
 
     def run_python_file(self, relpath, timeout=600):
         self.calls.append(("run_python", relpath))
@@ -22,6 +23,7 @@ class FakeSandbox:
 
     def pip_install(self, packages):
         self.calls.append(("pip_install", packages))
+        self.installed_packages.extend(packages)
         return ExecResult(0, f"installed {' '.join(packages)}", "")
 
     def start(self):
@@ -141,8 +143,9 @@ class _Block:
 
 
 class _Message:
-    def __init__(self, blocks):
+    def __init__(self, blocks, usage=None):
         self.content = blocks
+        self.usage = usage
 
 
 class FakeAnthropic:
@@ -232,7 +235,9 @@ class TestRunReproduction:
         paper, workdir = fake_agent_env
         (workdir / "REPORT.md").write_text("# Verdict: REPRODUCED")
         result = run_reproduction(paper, workdir, Console(record=True, width=200))
-        assert result.report.read_text() == "# Verdict: REPRODUCED"
+        text = result.report.read_text()
+        assert text.startswith("# Verdict: REPRODUCED")  # agent's words untouched
+        assert "## Run metadata" in text  # accounting footer appended
 
 
 class TestMidRunFailure:
@@ -271,6 +276,91 @@ class TestMidRunFailure:
         FakeAnthropic.raise_after_yield = httpx.ConnectError("api unreachable")
         run_reproduction(paper, workdir, Console(record=True, width=200))
         assert stopped  # teardown happened despite the failure
+
+
+class TestAccountingAndManifest:
+    def _usage(self, **kw):
+        from types import SimpleNamespace
+
+        defaults = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
+        defaults.update(kw)
+        return SimpleNamespace(**defaults)
+
+    def test_tokens_costs_and_manifest(self, fake_agent_env):
+        import json
+
+        paper, workdir = fake_agent_env
+        FakeAnthropic.messages_to_yield = [
+            _Message(
+                [_Block("text", text="plan"), _Block("tool_use", name="write_file")],
+                usage=self._usage(input_tokens=1000, output_tokens=200,
+                                  cache_creation_input_tokens=40_000),
+            ),
+            _Message(
+                [_Block("text", text="## Verdict\n\nPARTIALLY REPRODUCED")],
+                usage=self._usage(input_tokens=500, output_tokens=300,
+                                  cache_read_input_tokens=40_000),
+            ),
+        ]
+        (workdir / "REPORT.md").write_text(
+            "# Report\n\n## Target Result\n\nTc = 2.269 for the 2D Ising model.\n\n"
+            "## Verdict\n\nPARTIALLY REPRODUCED\n"
+        )
+        result = run_reproduction(paper, workdir, Console(record=True, width=200))
+
+        assert result.usage.input_tokens == 1500
+        assert result.usage.output_tokens == 500
+        assert result.usage.cache_read_input_tokens == 40_000
+        assert result.usage.cache_creation_input_tokens == 40_000
+        assert result.estimated_cost_usd is not None and result.estimated_cost_usd > 0
+
+        manifest = json.loads((workdir / "run.json").read_text())
+        assert manifest["arxiv_id"] == paper.arxiv_id
+        assert manifest["model"] == agent_mod.MODEL
+        assert manifest["status"] == "completed"
+        assert manifest["verdict"] == "PARTIALLY REPRODUCED"
+        assert manifest["target_result"].startswith("Tc = 2.269")
+        assert manifest["tokens"]["input_tokens"] == 1500
+        assert manifest["estimated_cost_usd"] == result.estimated_cost_usd
+        assert manifest["iterations"] == 2
+        assert "started_at" in manifest and "finished_at" in manifest
+
+        report_text = result.report.read_text()
+        assert "## Run metadata" in report_text
+        assert "Estimated cost: $" in report_text
+
+    def test_installed_packages_recorded_in_manifest(self, fake_agent_env, monkeypatch):
+        import json
+
+        paper, workdir = fake_agent_env
+
+        class InstallingSandbox(FakeSandbox):
+            def __enter__(self):
+                self.installed_packages = ["emcee==3.1.4"]
+                return super().__enter__()
+
+        monkeypatch.setattr(agent_mod, "DockerSandbox", InstallingSandbox)
+        run_reproduction(paper, workdir, Console(record=True, width=200))
+        manifest = json.loads((workdir / "run.json").read_text())
+        assert manifest["installed_packages"] == ["emcee==3.1.4"]
+
+    def test_manifest_written_even_on_api_failure(self, fake_agent_env):
+        import json
+
+        import httpx
+
+        paper, workdir = fake_agent_env
+        FakeAnthropic.raise_after_yield = httpx.ConnectError("api unreachable")
+        result = run_reproduction(paper, workdir, Console(record=True, width=200))
+        manifest = json.loads((workdir / "run.json").read_text())
+        assert manifest["status"] == "error"
+        assert "api unreachable" in manifest["error"]
+        assert result.manifest == workdir / "run.json"
 
 
 class TestRunCaps:

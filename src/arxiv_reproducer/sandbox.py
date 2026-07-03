@@ -28,6 +28,10 @@ from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
+from .logs import get_logger
+
+logger = get_logger("sandbox")
+
 SANDBOX_IMAGE = "arxiv-repro-sandbox:latest"
 EXEC_TIMEOUT = 600  # seconds per command
 INSTALL_TIMEOUT = 300  # seconds per pip install
@@ -76,6 +80,7 @@ def ensure_image(image: str = SANDBOX_IMAGE) -> None:
     """Build the sandbox image from the packaged Dockerfile if it is missing."""
     if image_exists(image):
         return
+    logger.info("building sandbox image %s", image)
     subprocess.run(
         ["docker", "build", "-t", image, "-"],
         input=sandbox_dockerfile().encode(),
@@ -100,6 +105,7 @@ def _remove_container(name: str) -> None:
 
 def _cleanup_all_containers() -> None:
     for name in list(_ACTIVE_CONTAINERS):
+        logger.warning("emergency cleanup of container %s", name)
         _remove_container(name)
         _ACTIVE_CONTAINERS.discard(name)
 
@@ -194,10 +200,12 @@ class DockerSandbox:
         )
         self._started = True
         _ACTIVE_CONTAINERS.add(self.name)
+        logger.info("container %s started (image=%s, workdir=%s)", self.name, self.image, self.workdir)
 
     def exec(self, command: list[str], timeout: int = EXEC_TIMEOUT) -> ExecResult:
         if not self._started:
             raise RuntimeError("Sandbox not started — call start() first")
+        logger.debug("exec in %s: %s", self.name, " ".join(command))
         try:
             proc = subprocess.run(
                 ["docker", "exec", self.name, *command],
@@ -221,7 +229,9 @@ class DockerSandbox:
         """
         problem = validate_packages(packages)
         if problem is not None:
+            logger.warning("refused pip install: %s", problem)
             return ExecResult(2, "", f"Refused: {problem}")
+        logger.info("pip install (networked installer): %s", " ".join(packages))
         try:
             proc = subprocess.run(
                 [
@@ -247,6 +257,7 @@ class DockerSandbox:
 
     def stop(self) -> None:
         if self._started:
+            logger.info("container %s stopped", self.name)
             _remove_container(self.name)
             _ACTIVE_CONTAINERS.discard(self.name)
             self._started = False
