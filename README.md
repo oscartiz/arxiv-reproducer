@@ -186,14 +186,14 @@ Poor candidates: anything needing proprietary data, large-scale training, or phy
 
 - [ ] **Reproduction gallery** — reports for 5+ papers, committed under `examples/`
 - [ ] **Figure-to-figure comparison** — extract the paper's original figures from the PDF and render them beside the regenerated ones in the report
-- [ ] **Cost & token accounting** — per-run usage summary (input/output/cache-read tokens, dollar estimate)
+- [x] **Cost & token accounting** — per-run usage summary (input/output/cache-read tokens, dollar estimate)
 - [ ] **Batch screening mode** — headless runs over a list of IDs, producing a feasibility/verdict spreadsheet
 - [ ] **Calibrated verdicts** — have the agent attach a confidence to its verdict, then measure calibration against human review
-- [ ] **Network-isolated execution** — pre-bake a scientific-stack image so the container can run with `--network none` after setup
+- [x] **Network-isolated execution** — pre-bake a scientific-stack image so the container can run with `--network none` after setup
 
 ## Status
 
-Early stage. The full pipeline — fetch, agent loop, sandbox, report — is implemented and tested at the unit level; the reproduction gallery is pending funded API runs. Contributions and paper suggestions are welcome via issues.
+Early stage. The full pipeline — fetch, agent loop, sandbox, report — is implemented, with unit tests and a real-Docker integration suite run in CI; the reproduction gallery is pending funded API runs. Contributions and paper suggestions are welcome via issues.
 
 ## License
 
