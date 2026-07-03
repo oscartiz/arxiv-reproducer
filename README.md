@@ -4,11 +4,12 @@
 
 **An AI agent that attempts to reproduce computational results from arXiv papers — and honestly reports how close it got.**
 
-Give it an arXiv ID. It downloads the paper, reads it, picks a quantitative result it believes can be regenerated from the method description alone, implements that method from scratch in a sandboxed Python environment, runs it, and writes a reproduction report comparing its numbers against the paper's — ending with one of three verdicts: `REPRODUCED`, `PARTIALLY REPRODUCED`, or `NOT REPRODUCED`.
+Give it an arXiv ID. It downloads the paper, reads it, picks a quantitative result it believes can be regenerated from the method description alone, implements that method from scratch in a network-isolated Python sandbox, runs it, and writes a reproduction report comparing its numbers against the paper's — ending with one of three verdicts: `REPRODUCED`, `PARTIALLY REPRODUCED`, or `NOT REPRODUCED`.
 
 ```bash
 arxiv-repro 2301.12345
-# → runs/2301.12345/REPORT.md, plus every script it wrote and every figure it generated
+# → runs/2301.12345/latest/REPORT.md — plus every script it wrote, every
+#   figure it generated, and a machine-readable run.json
 ```
 
 ---
@@ -46,7 +47,10 @@ boundary conditions in Section III which I missed. Fixing...
 ...
 → write_file        # REPORT.md
 
-Done. Report: runs/2301.12345/REPORT.md
+38402 in / 21630 out / 964512 cache-read tokens · estimated cost $1.94
+· 1247s · 23 iterations
+
+Done. Report: runs/2301.12345/20260703-142205/REPORT.md
 ```
 
 The resulting `REPORT.md` contains:
@@ -59,6 +63,29 @@ The resulting `REPORT.md` contains:
 | **Results Comparison** | Paper-reported vs. reproduced values, with relative errors |
 | **Figures** | Regenerated plots saved as PNGs in the workspace |
 | **Verdict** | `REPRODUCED` / `PARTIALLY REPRODUCED` / `NOT REPRODUCED`, with justification |
+| **Run metadata** | Status, model, iterations, wall clock, token counts, estimated cost — appended automatically |
+
+### What a run leaves behind
+
+Each run gets a fresh timestamped workspace; prior reports are never clobbered, and a rerun of the same paper reuses the cached PDF:
+
+```
+runs/2301.12345/
+├── paper.pdf                # download cache, shared across runs
+├── 20260703-142205/         # one workspace per run
+│   ├── paper.pdf            # in-workspace copy, so auditors see what the agent saw
+│   ├── simulate.py, …       # every script the agent wrote
+│   ├── figure3.png, …       # every figure it generated
+│   ├── REPORT.md
+│   └── run.json             # machine-readable manifest
+└── latest → 20260703-142205
+```
+
+`run.json` records the arXiv ID, title, model, status, extracted verdict, target result, iteration count, wall clock, per-category token totals, estimated cost, installed packages, and start/finish timestamps — so batches of runs are queryable in aggregate:
+
+```bash
+jq -r '[.arxiv_id, .verdict, .status, .estimated_cost_usd] | @tsv' runs/*/latest/run.json
+```
 
 ## Architecture
 
@@ -78,14 +105,14 @@ The resulting `REPORT.md` contains:
                               └─────────────────────────┘
                                            │
                                            ▼
-                          REPORT.md  +  generated figures
-                              (runs/<arxiv-id>/)
+                          REPORT.md + run.json + figures
+                          (runs/<arxiv-id>/<timestamp>/)
 ```
 
 The pipeline has three deliberately decoupled layers:
 
 **1. Paper acquisition** (`src/arxiv_reproducer/paper.py`)
-Metadata (title, abstract, authors) comes from the arXiv Atom API; the full text is extracted from the PDF with `pypdf`. The ID parser accepts bare IDs (`2301.12345`), versioned IDs (`2301.12345v2`), old-style IDs (`hep-th/9901001`), and full `arxiv.org/abs/...` or `/pdf/...` URLs. PDFs are cached per run directory so repeated runs don't re-download.
+Metadata (title, abstract, authors) comes from the arXiv Atom API; the full text is extracted from the PDF with `pypdf`. The ID parser accepts bare IDs (`2301.12345`), versioned IDs (`2301.12345v2`), old-style IDs (`hep-th/9901001`), and full `arxiv.org/abs/...` or `/pdf/...` URLs. Fetches retry transient failures (408/429/5xx, connection errors) with exponential backoff and jitter; anything else surfaces immediately. Extraction tolerates individual broken pages, but a PDF that yields almost no text — a scanned paper — is refused up front with a clear error rather than fed to the agent as garbage.
 
 **2. The agent loop** (`src/arxiv_reproducer/agent.py`, `prompts.py`)
 A Claude tool-use loop built on the Anthropic SDK's tool runner. The agent gets exactly four tools, all scoped to the run's workspace:
@@ -95,14 +122,26 @@ A Claude tool-use loop built on the Anthropic SDK's tool runner. The agent gets 
 | `write_file` | Create/overwrite a script or data file in the workspace |
 | `read_file` | Read back any workspace file |
 | `run_python` | Execute a workspace script inside the sandbox, return stdout/stderr/exit code |
-| `install_packages` | `pip install` into the sandbox (never the host) |
+| `install_packages` | Wheels-only `pip install` into the sandbox's `/workspace/.deps` (never the host) |
 
-Both file tools resolve paths and reject anything that escapes the workspace root, so a confused (or prompt-injected — papers are untrusted input!) agent cannot read or write outside its run directory.
+Both file tools resolve paths and reject anything that escapes the workspace root, so a confused (or prompt-injected — papers are untrusted input!) agent cannot read or write outside its run directory. The loop itself is bounded by an iteration cap and a wall-clock cap, and accumulates every message's token usage for the final accounting.
 
 The system prompt (`prompts.py`) encodes the scientific workflow: *select a feasible target → state a plan → implement with exact hyperparameters from the paper → iterate on errors → quantify the discrepancy → write the report*. It also encodes the honesty rules: never fudge numbers, document every assumption, and explicitly note when compute was scaled down (fewer samples, smaller grids) and what effect that should have.
 
-**3. The sandbox** (`src/arxiv_reproducer/sandbox.py`)
-Each run gets a fresh `python:3.12-slim` Docker container with a 4 GB memory limit, 2 CPUs, and a single bind mount: the run's workspace at `/workspace`. The container lives for the whole run, so `pip install`s and intermediate files persist across tool calls — then it's destroyed. Agent-generated code never executes on the host, and per-command timeouts (10 min) plus output truncation (20 KB returned to the model) keep runaway scripts from burning the run.
+**3. The sandbox** (`src/arxiv_reproducer/sandbox.py`, `docker/sandbox.Dockerfile`)
+The trust boundary of the tool: papers are untrusted input, and the code the agent writes under their influence is untrusted output. Execution happens in a long-lived container built from a pre-baked image — the scientific stack (numpy, scipy, matplotlib, pandas, sympy, scikit-learn, networkx, pillow) is installed at *build* time, on a `python:3.12-slim` base pinned by digest — so at *run* time the container needs no network at all:
+
+| Guarantee | Mechanism |
+|---|---|
+| No network | `--network none` — agent code cannot exfiltrate data or phone home |
+| No privileges | Non-root user, `--cap-drop ALL`, `no-new-privileges` |
+| No host writes | Read-only root filesystem; writable only at the bind-mounted `/workspace` and a size-capped `noexec` `/tmp` tmpfs |
+| No runaways | Memory / CPU / pid limits, per-command timeouts, output truncated to 20 KB before it reaches the model |
+| No leaks | Teardown guaranteed by context manager + `atexit` + SIGTERM hooks — a crash or kill never strands a container |
+
+Package installs are **two-phase**: `install_packages` runs in a separate, ephemeral container that *does* have network but only ever executes a validated `pip install --only-binary=:all:` — plain PyPI names with optional version pins; URLs, flags, and source builds are refused before Docker is even invoked — into `/workspace/.deps`, which the offline exec container imports via `PYTHONPATH`. Agent-generated code never runs with network access, and never executes on the host.
+
+The container lives for the whole run, so installs and intermediate files persist across tool calls — then it's destroyed.
 
 ## Design decisions worth reading
 
@@ -118,23 +157,59 @@ The model decides per-step how much to reason — deep when interpreting an ambi
 **Honesty by construction, not just by instruction.**
 Beyond the prompt rules, the artifact design enforces auditability: the verdict is only as good as the workspace backing it, and the workspace is always preserved. A reviewer (or a future automated grader) can re-run every script in the report.
 
+**Every run ends in a coherent state.**
+However a run ends — completed, capped, API failure after the SDK's retries, Ctrl-C — the container is torn down, `REPORT.md` exists (the agent's, or a stub saying exactly what happened and when), and `run.json` records the status. A batch over fifty papers cannot be poisoned by one hung run or one mystery directory.
+
 **Feasibility triage is part of the agent's job.**
 Most papers are *not* reproducible in a sandbox — they need proprietary data, weeks of GPU time, or lab hardware. The agent's first task is explicitly to find the *most feasibly reproducible* result, prefer simulations and analytical/numerical results, and say so if no feasible target exists. A correct "nothing here is reproducible without X" is a useful classification, not a failure of the tool.
+
+**The supply chain is pinned.**
+Host dependencies install from a universal lockfile (`uv pip compile`, runtime + dev); the sandbox base image is pinned by digest, so it cannot drift or be tag-hijacked between builds. What ran yesterday is what runs today.
+
+## Configuration
+
+Every tunable — model, token/iteration/wall-clock caps, container resource limits, timeouts, image tag — lives in `config.py`, with three sources; later wins:
+
+1. Built-in defaults (everything works with no config at all)
+2. `./arxiv-repro.toml`, or the file named in `ARXIV_REPRO_CONFIG`
+3. `ARXIV_REPRO_*` environment variables
+
+```toml
+# arxiv-repro.toml — trade accuracy for cost, loosen limits for heavier sims
+model = "claude-sonnet-5"
+max_iterations = 40
+memory_limit = "8g"
+```
+
+```bash
+ARXIV_REPRO_MODEL=claude-haiku-4-5 arxiv-repro 2301.12345   # one-off override
+```
+
+Every key is documented in [`arxiv-repro.example.toml`](arxiv-repro.example.toml). Configuration errors fail fast and say exactly what's wrong — unknown keys are listed alongside the valid set. Deliberately *not* configurable: the sandbox hardening flags. Network isolation and privilege dropping are invariants, not tunables.
 
 ## Repository tour
 
 ```
 arxiv-reproducer/
 ├── src/arxiv_reproducer/
-│   ├── paper.py        # arXiv API + PDF text extraction
-│   ├── agent.py        # Claude tool-use loop + tool definitions
-│   ├── prompts.py      # system prompt: workflow + honesty rules
-│   ├── sandbox.py      # Docker container lifecycle + exec
-│   └── cli.py          # arxiv-repro entry point
-├── tests/
-│   └── test_paper.py   # ID-parsing tests (no network, no API key needed)
-├── runs/               # per-paper workspaces (gitignored)
-└── pyproject.toml
+│   ├── paper.py             # arXiv API + PDF extraction, retried, scan-refusing
+│   ├── agent.py             # Claude tool-use loop, tool definitions, run manifest
+│   ├── prompts.py           # system prompt: workflow + honesty rules
+│   ├── sandbox.py           # container lifecycle, hardening, two-phase installs
+│   ├── config.py            # defaults < TOML < env, validated with clear errors
+│   ├── costs.py             # per-run token accounting + dollar estimate
+│   ├── manifest.py          # run.json writer + verdict extraction
+│   ├── runs.py              # timestamped, non-clobbering run directories
+│   ├── retry.py             # exponential backoff for transient HTTP failures
+│   ├── logs.py              # structured logging (plain or JSON lines)
+│   ├── cli.py               # arxiv-repro entry point
+│   └── docker/
+│       └── sandbox.Dockerfile   # pre-baked scientific image, digest-pinned base
+├── tests/                   # full suite runs with no Docker and no API key
+├── arxiv-repro.example.toml # every config key, documented
+├── requirements-lock.txt    # universal lockfile (uv) — CI installs from this
+├── Makefile                 # install / test / integration / lint / typecheck / check
+└── runs/                    # per-paper workspaces (gitignored)
 ```
 
 ## Installation & usage
@@ -144,24 +219,29 @@ Requirements: Python 3.11+, Docker running, and an [Anthropic API key](https://p
 ```bash
 git clone https://github.com/oscartiz/arxiv-reproducer
 cd arxiv-reproducer
-pip install -e ".[dev]"
+python3 -m venv .venv
+make install         # locked dependencies + the package, editable
 
-# Works without an API key:
-pytest                       # test suite
-arxiv-repro --help
+# Works without an API key or Docker:
+make check           # lint + types + full unit suite
+.venv/bin/arxiv-repro --help
 
-# Needs an API key + Docker:
-export ANTHROPIC_API_KEY=sk-ant-...
-arxiv-repro 2301.12345
-arxiv-repro https://arxiv.org/abs/2301.12345   # URLs work too
-arxiv-repro hep-th/9901001                     # old-style IDs work too
+# A real run needs credentials + Docker:
+export ANTHROPIC_API_KEY=sk-ant-...    # or `ant auth login`
+.venv/bin/arxiv-repro 2301.12345
+.venv/bin/arxiv-repro https://arxiv.org/abs/2301.12345   # URLs work too
+.venv/bin/arxiv-repro hep-th/9901001                     # old-style IDs work too
 ```
 
-Each run creates `runs/<arxiv-id>/` containing the downloaded PDF, every script the agent wrote, generated figures, and `REPORT.md`.
+The first real run builds the sandbox image, which takes a few minutes; after that, container start is instant. `make build-image` builds it ahead of time.
+
+Useful flags: `--runs-dir` to relocate the workspaces, `-v` for debug logging, `--log-json` for JSON log lines on stderr (the human-facing progress stays on stdout either way).
 
 ### Cost
 
 A reproduction run is a long agentic loop against a frontier model — expect on the order of **a few dollars per paper**, dominated by input tokens (mitigated heavily by prompt caching) and the number of debug iterations. Simple analytical results converge in a handful of iterations; finicky simulations take more. There is no free-tier mode: the project's compute *is* the API usage.
+
+You never have to guess what a run cost: the exact token counts and dollar estimate are printed at the end of every run, appended to `REPORT.md`, and recorded in `run.json`.
 
 ## What makes a good target paper
 
@@ -190,6 +270,17 @@ Poor candidates: anything needing proprietary data, large-scale training, or phy
 - [ ] **Batch screening mode** — headless runs over a list of IDs, producing a feasibility/verdict spreadsheet
 - [ ] **Calibrated verdicts** — have the agent attach a confidence to its verdict, then measure calibration against human review
 - [x] **Network-isolated execution** — pre-bake a scientific-stack image so the container can run with `--network none` after setup
+
+## Development
+
+```bash
+make help            # list all targets
+make check           # ruff + mypy (disallow_untyped_defs) + pytest, 90% coverage floor
+make integration     # real-Docker suite: proves the hardening against a live daemon
+make lock            # regenerate requirements-lock.txt after changing dependencies
+```
+
+The unit suite needs neither Docker nor an API key. The integration tests are opt-in (`pytest --run-docker -k RealDocker`) and CI runs them on every push in a dedicated job that builds the sandbox image from scratch and re-proves the container guarantees — network isolation, non-root with read-only rootfs, two-phase install, teardown — against a real Docker daemon. The main CI job runs lint, mypy, and the unit suite on Python 3.11 and 3.12, installing from the lockfile.
 
 ## Status
 
