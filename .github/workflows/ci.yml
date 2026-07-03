@@ -16,6 +16,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev]"
+      - run: pip install -r requirements-lock.txt
+      - run: pip install -e . --no-deps
       - run: ruff check src tests
+      - run: mypy src
       - run: pytest -q
+
+  sandbox-image:
+    # Builds the pre-baked sandbox image and proves the container hardening
+    # against a real Docker daemon (network isolation, non-root, read-only
+    # rootfs, two-phase install, teardown).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: docker build -t arxiv-repro-sandbox:latest -f src/arxiv_reproducer/docker/sandbox.Dockerfile .
+      - run: pip install -r requirements-lock.txt
+      - run: pip install -e . --no-deps
+      - run: pytest -q --run-docker -k RealDocker --no-cov

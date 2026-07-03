@@ -5,6 +5,7 @@ from rich.console import Console
 
 from arxiv_reproducer import agent as agent_mod
 from arxiv_reproducer.agent import MAX_READ_CHARS, build_tools, run_reproduction
+from arxiv_reproducer.config import Config, get_config, set_config
 from arxiv_reproducer.paper import Paper
 from arxiv_reproducer.sandbox import ExecResult
 
@@ -201,7 +202,7 @@ class TestRunReproduction:
         run_reproduction(paper, workdir, Console(record=True, width=200))
 
         kwargs = FakeAnthropic.last_kwargs
-        assert kwargs["model"] == agent_mod.MODEL
+        assert kwargs["model"] == get_config().model
         assert len(kwargs["tools"]) == 4
         first_block = kwargs["messages"][0]["content"][0]
         assert first_block["cache_control"] == {"type": "ephemeral"}
@@ -222,7 +223,7 @@ class TestRunReproduction:
     def test_client_uses_sdk_retries(self, fake_agent_env):
         paper, workdir = fake_agent_env
         run_reproduction(paper, workdir, Console(record=True, width=200))
-        assert FakeAnthropic.init_kwargs == {"max_retries": agent_mod.API_MAX_RETRIES}
+        assert FakeAnthropic.init_kwargs == {"max_retries": get_config().api_max_retries}
 
     def test_missing_report_gets_placeholder(self, fake_agent_env):
         paper, workdir = fake_agent_env
@@ -321,7 +322,7 @@ class TestAccountingAndManifest:
 
         manifest = json.loads((workdir / "run.json").read_text())
         assert manifest["arxiv_id"] == paper.arxiv_id
-        assert manifest["model"] == agent_mod.MODEL
+        assert manifest["model"] == get_config().model
         assert manifest["status"] == "completed"
         assert manifest["verdict"] == "PARTIALLY REPRODUCED"
         assert manifest["target_result"].startswith("Tc = 2.269")
@@ -366,9 +367,9 @@ class TestAccountingAndManifest:
 class TestRunCaps:
     """A run must not loop forever burning API spend."""
 
-    def test_iteration_cap_stops_the_loop(self, fake_agent_env, monkeypatch):
+    def test_iteration_cap_stops_the_loop(self, fake_agent_env):
         paper, workdir = fake_agent_env
-        monkeypatch.setattr(agent_mod, "MAX_ITERATIONS", 3)
+        set_config(Config(max_iterations=3))
         FakeAnthropic.messages_to_yield = [
             _Message([_Block("text", text=f"message-{i}")]) for i in range(10)
         ]
@@ -383,7 +384,10 @@ class TestRunCaps:
 
     def test_wall_clock_cap_stops_the_loop(self, fake_agent_env, monkeypatch):
         paper, workdir = fake_agent_env
-        monkeypatch.setattr(agent_mod, "MAX_WALL_CLOCK_SECONDS", 0)
+        # Advance a fake clock by ~3 hours per call: the first post-message
+        # check already exceeds the (default 3600s) cap.
+        ticks = iter(range(0, 100_000, 10_000))
+        monkeypatch.setattr(agent_mod.time, "monotonic", lambda: float(next(ticks)))
         FakeAnthropic.messages_to_yield = [
             _Message([_Block("text", text=f"message-{i}")]) for i in range(5)
         ]

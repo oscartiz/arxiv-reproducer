@@ -1,5 +1,15 @@
 import pytest
 
+from arxiv_reproducer.config import set_config
+
+
+@pytest.fixture(autouse=True)
+def fresh_config():
+    """Each test sees a freshly-loaded config (env changes take effect)."""
+    set_config(None)
+    yield
+    set_config(None)
+
 
 def pytest_addoption(parser):
     parser.addoption(

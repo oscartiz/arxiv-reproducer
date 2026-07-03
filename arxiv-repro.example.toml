@@ -1,0 +1,20 @@
+# Optional config file for arxiv-repro. Copy to ./arxiv-repro.toml (or point
+# ARXIV_REPRO_CONFIG at it). Every key is optional; defaults shown. Each key
+# can also be set via environment variable: ARXIV_REPRO_<KEY IN UPPERCASE>,
+# which wins over this file.
+
+# --- Agent ---
+model = "claude-opus-4-8"        # Anthropic model ID
+max_tokens = 16000               # per-response output cap
+max_iterations = 60              # whole-run message cap
+max_wall_clock_seconds = 3600    # whole-run time cap
+api_max_retries = 5              # Anthropic SDK retry count (429/5xx)
+
+# --- Sandbox ---
+sandbox_image = "arxiv-repro-sandbox:latest"
+exec_timeout = 600               # seconds per command in the container
+install_timeout = 300            # seconds per pip install
+memory_limit = "4g"
+cpu_limit = "2"
+pids_limit = 256
+tmp_size = "512m"                # size of the writable /tmp tmpfs
