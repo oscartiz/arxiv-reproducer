@@ -3,17 +3,34 @@
 from __future__ import annotations
 
 import argparse
-import shutil
+import os
 import sys
 from pathlib import Path
 
+import httpx
 from rich.console import Console
 
 from .agent import run_reproduction
 from .paper import fetch_paper, parse_arxiv_id
+from .sandbox import check_docker
 
 
-def main() -> None:
+def has_anthropic_credentials() -> bool:
+    """True if the Anthropic SDK will find some credential source.
+
+    The SDK resolves ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or an
+    `ant auth login` OAuth profile on disk — an unset env var alone does
+    not mean there are no credentials.
+    """
+    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        return True
+    config_dir = Path(
+        os.environ.get("ANTHROPIC_CONFIG_DIR", Path.home() / ".config" / "anthropic")
+    )
+    return config_dir.is_dir() and any(config_dir.glob("credentials/*.json"))
+
+
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="arxiv-repro",
         description="Attempt to reproduce a computational result from an arXiv paper.",
@@ -25,19 +42,46 @@ def main() -> None:
         default=Path("runs"),
         help="Directory where per-paper workspaces are created (default: ./runs)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     console = Console()
 
-    if shutil.which("docker") is None:
-        console.print("[red]Docker is required but was not found on PATH.[/red]")
+    docker_problem = check_docker()
+    if docker_problem is not None:
+        console.print(f"[red]{docker_problem}[/red]")
         sys.exit(1)
 
-    arxiv_id = parse_arxiv_id(args.paper)
+    if not has_anthropic_credentials():
+        console.print(
+            "[red]No Anthropic credentials found.[/red] "
+            "Set ANTHROPIC_API_KEY (see .env.example) or run `ant auth login`."
+        )
+        sys.exit(1)
+
+    try:
+        arxiv_id = parse_arxiv_id(args.paper)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+
     workdir = args.runs_dir / arxiv_id.replace("/", "_")
 
     console.print(f"[bold]Fetching[/bold] arXiv:{arxiv_id} ...")
-    paper = fetch_paper(arxiv_id, workdir)
+    try:
+        paper = fetch_paper(arxiv_id, workdir)
+    except httpx.HTTPStatusError as exc:
+        console.print(
+            f"[red]arXiv returned HTTP {exc.response.status_code} for {arxiv_id} — "
+            "check that the ID exists.[/red]"
+        )
+        sys.exit(1)
+    except httpx.HTTPError as exc:
+        console.print(f"[red]Network error fetching {arxiv_id}: {exc}[/red]")
+        sys.exit(1)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        sys.exit(1)
+
     console.print(f"[bold]{paper.title}[/bold]")
     console.print(f"{', '.join(paper.authors)}\n")
 

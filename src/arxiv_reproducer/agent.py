@@ -16,6 +16,22 @@ MODEL = "claude-opus-4-8"
 MAX_TOKENS = 16_000
 
 
+MAX_READ_CHARS = 50_000
+
+
+def _resolve_in_workspace(workdir: Path, path: str) -> Path | None:
+    """Resolve an agent-supplied path, returning None unless it stays inside the
+    workspace after following symlinks. Paths are UNTRUSTED model output."""
+    try:
+        target = (workdir / path).resolve()
+    except (ValueError, OSError):
+        # e.g. embedded null bytes, paths too long for the OS
+        return None
+    if not target.is_relative_to(workdir):
+        return None
+    return target
+
+
 def build_tools(sandbox: DockerSandbox):
     """Create the agent's tools, bound to one sandbox instance."""
 
@@ -27,11 +43,14 @@ def build_tools(sandbox: DockerSandbox):
             path: Path relative to the workspace root, e.g. "simulate.py".
             content: Full file content.
         """
-        target = (sandbox.workdir / path).resolve()
-        if not target.is_relative_to(sandbox.workdir):
+        target = _resolve_in_workspace(sandbox.workdir, path)
+        if target is None:
             return "Error: path escapes the workspace"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        except OSError as exc:
+            return f"Error: could not write {path}: {exc}"
         return f"Wrote {len(content)} chars to {path}"
 
     @beta_tool
@@ -41,12 +60,21 @@ def build_tools(sandbox: DockerSandbox):
         Args:
             path: Path relative to the workspace root.
         """
-        target = (sandbox.workdir / path).resolve()
-        if not target.is_relative_to(sandbox.workdir):
+        target = _resolve_in_workspace(sandbox.workdir, path)
+        if target is None:
             return "Error: path escapes the workspace"
         if not target.exists():
             return f"Error: {path} does not exist"
-        return target.read_text()
+        try:
+            text = target.read_text()
+        except UnicodeDecodeError:
+            return f"Error: {path} is not a text file"
+        except OSError as exc:
+            return f"Error: could not read {path}: {exc}"
+        if len(text) > MAX_READ_CHARS:
+            omitted = len(text) - MAX_READ_CHARS
+            return text[:MAX_READ_CHARS] + f"\n... [truncated, {omitted} chars omitted]"
+        return text
 
     @beta_tool
     def run_python(path: str) -> str:

@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6"]
 
 [project.scripts]
 arxiv-repro = "arxiv_reproducer.cli:main"
@@ -28,3 +28,16 @@ packages = ["src/arxiv_reproducer"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.pytest.ini_options]
+addopts = "--cov=arxiv_reproducer --cov-report=term-missing"
+markers = [
+    "docker: needs a real Docker daemon (opt-in via --run-docker)",
+]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 90

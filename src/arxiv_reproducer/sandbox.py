@@ -7,6 +7,7 @@ within a run but never touch the host Python environment.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -14,6 +15,16 @@ from pathlib import Path
 
 DEFAULT_IMAGE = "python:3.12-slim"
 EXEC_TIMEOUT = 600  # seconds per command
+
+
+def check_docker() -> str | None:
+    """Return None if Docker is usable, else a human-readable problem."""
+    if shutil.which("docker") is None:
+        return "Docker CLI not found on PATH — install Docker (https://docs.docker.com/get-docker/)."
+    probe = subprocess.run(["docker", "info"], capture_output=True)
+    if probe.returncode != 0:
+        return "Docker daemon is not running — start Docker and try again."
+    return None
 
 
 @dataclass
