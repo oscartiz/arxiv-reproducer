@@ -13,6 +13,7 @@ import httpx
 from rich.console import Console
 
 from .agent import run_reproduction
+from .logs import setup_logging
 from .paper import PdfExtractionError, fetch_paper, parse_arxiv_id
 from .runs import new_run_dir, safe_dir_name
 from .sandbox import SANDBOX_IMAGE, check_docker, ensure_image, image_exists
@@ -45,8 +46,15 @@ def main(argv: list[str] | None = None) -> None:
         default=Path("runs"),
         help="Directory where per-paper workspaces are created (default: ./runs)",
     )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug-level logging"
+    )
+    parser.add_argument(
+        "--log-json", action="store_true", help="Emit logs as JSON lines on stderr"
+    )
     args = parser.parse_args(argv)
 
+    setup_logging(verbose=args.verbose, json_logs=args.log_json)
     console = Console()
 
     docker_problem = check_docker()
@@ -110,6 +118,16 @@ def main(argv: list[str] | None = None) -> None:
     console.print("[bold]Starting reproduction agent[/bold] (this can take a while)\n")
     result = run_reproduction(paper, workdir, console)
 
+    usage = result.usage
+    cost = (
+        f"${result.estimated_cost_usd:.4f}" if result.estimated_cost_usd is not None else "n/a"
+    )
+    console.print(
+        f"\n[dim]{usage.input_tokens} in / {usage.output_tokens} out / "
+        f"{usage.cache_read_input_tokens} cache-read tokens · "
+        f"estimated cost {cost} · {result.wall_clock_seconds:.0f}s · "
+        f"{result.iterations} iterations[/dim]"
+    )
     if result.status == "completed":
         console.print(f"\n[green]Done.[/green] Report: [bold]{result.report}[/bold]")
     else:

@@ -10,7 +10,10 @@ from pathlib import Path
 import httpx
 from pypdf import PdfReader
 
+from .logs import get_logger
 from .retry import retry_with_backoff
+
+logger = get_logger("paper")
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_PDF = "https://arxiv.org/pdf/{arxiv_id}"
@@ -60,7 +63,13 @@ def fetch_paper(raw_id: str, workdir: Path) -> Paper:
                 response.raise_for_status()
                 return response
 
-            return retry_with_backoff(once)
+            def log_retry(attempt: int, delay: float, exc: Exception) -> None:
+                logger.warning(
+                    "transient failure fetching %s (attempt %d, retrying in %.1fs): %s",
+                    url, attempt, delay, exc,
+                )
+
+            return retry_with_backoff(once, on_retry=log_retry)
 
         meta = get(ARXIV_API, params={"id_list": arxiv_id, "max_results": 1})
         entry = ET.fromstring(meta.text).find("atom:entry", ATOM_NS)
