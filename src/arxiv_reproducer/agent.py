@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import anthropic
+import httpx
 from anthropic import beta_tool
 from rich.console import Console
 
@@ -20,6 +22,17 @@ MAX_TOKENS = 16_000
 # loop forever burning API spend. Per-command timeouts live in sandbox.py.
 MAX_ITERATIONS = 60
 MAX_WALL_CLOCK_SECONDS = 3600
+
+# Anthropic SDK built-in retry handles 429/5xx/connection errors with backoff.
+API_MAX_RETRIES = 5
+
+
+@dataclass
+class RunResult:
+    report: Path
+    status: str  # "completed" | "error" | "iteration_cap" | "wall_clock_cap"
+    error: str | None = None
+    iterations: int = 0
 
 
 MAX_READ_CHARS = 50_000
@@ -108,9 +121,16 @@ def build_tools(sandbox: DockerSandbox):
     return [write_file, read_file, run_python, install_packages]
 
 
-def run_reproduction(paper: Paper, workdir: Path, console: Console) -> Path:
-    """Run the full agent loop against a paper. Returns the path to REPORT.md."""
-    client = anthropic.Anthropic()
+def run_reproduction(paper: Paper, workdir: Path, console: Console) -> RunResult:
+    """Run the full agent loop against a paper.
+
+    Always leaves the workspace in a coherent state: REPORT.md exists when
+    this returns, whatever happened mid-run, and the container is torn down.
+    """
+    client = anthropic.Anthropic(max_retries=API_MAX_RETRIES)
+    status = "completed"
+    error: str | None = None
+    iterations = 0
 
     with DockerSandbox(workdir) as sandbox:
         runner = client.beta.messages.tool_runner(
@@ -138,26 +158,41 @@ def run_reproduction(paper: Paper, workdir: Path, console: Console) -> Path:
         )
 
         started = time.monotonic()
-        for iteration, message in enumerate(runner, start=1):
-            for block in message.content:
-                if block.type == "text":
-                    console.print(block.text)
-                elif block.type == "tool_use":
-                    console.print(f"[dim]→ {block.name}[/dim]")
-            if iteration >= MAX_ITERATIONS:
-                console.print(
-                    f"[yellow]Stopping: iteration cap reached ({MAX_ITERATIONS}).[/yellow]"
-                )
-                break
-            if time.monotonic() - started > MAX_WALL_CLOCK_SECONDS:
-                console.print(
-                    f"[yellow]Stopping: wall-clock cap reached ({MAX_WALL_CLOCK_SECONDS}s).[/yellow]"
-                )
-                break
+        try:
+            for message in runner:
+                iterations += 1
+                for block in message.content:
+                    if block.type == "text":
+                        console.print(block.text)
+                    elif block.type == "tool_use":
+                        console.print(f"[dim]→ {block.name}[/dim]")
+                if iterations >= MAX_ITERATIONS:
+                    status = "iteration_cap"
+                    console.print(
+                        f"[yellow]Stopping: iteration cap reached ({MAX_ITERATIONS}).[/yellow]"
+                    )
+                    break
+                if time.monotonic() - started > MAX_WALL_CLOCK_SECONDS:
+                    status = "wall_clock_cap"
+                    console.print(
+                        f"[yellow]Stopping: wall-clock cap reached "
+                        f"({MAX_WALL_CLOCK_SECONDS}s).[/yellow]"
+                    )
+                    break
+        except (anthropic.APIError, httpx.HTTPError) as exc:
+            # SDK retries are exhausted by the time we get here.
+            status = "error"
+            error = f"{type(exc).__name__}: {exc}"
+            console.print(f"[red]Agent loop aborted: {error}[/red]")
 
     report = workdir / "REPORT.md"
     if not report.exists():
-        report.write_text(
-            "# Reproduction report missing\n\nThe agent finished without writing REPORT.md.\n"
-        )
-    return report
+        lines = [
+            "# Reproduction report missing",
+            "",
+            f"The run ended with status `{status}` before the agent wrote REPORT.md.",
+        ]
+        if error:
+            lines += ["", f"Error: {error}"]
+        report.write_text("\n".join(lines) + "\n")
+    return RunResult(report=report, status=status, error=error, iterations=iterations)

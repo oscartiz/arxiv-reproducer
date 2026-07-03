@@ -4,7 +4,8 @@ import httpx
 import pytest
 
 from arxiv_reproducer import paper as paper_mod
-from arxiv_reproducer.paper import fetch_paper, parse_arxiv_id
+from arxiv_reproducer import retry as retry_mod
+from arxiv_reproducer.paper import PdfExtractionError, _extract_text, fetch_paper, parse_arxiv_id
 
 
 @pytest.mark.parametrize(
@@ -39,6 +40,9 @@ ATOM_FEED = """\
 
 EMPTY_FEED = '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
 
+# Captured before any monkeypatching so tests can build real clients.
+REAL_HTTPX_CLIENT = httpx.Client
+
 
 def minimal_pdf_bytes() -> bytes:
     from pypdf import PdfWriter
@@ -53,20 +57,26 @@ def minimal_pdf_bytes() -> bytes:
 @pytest.fixture
 def arxiv_transport(monkeypatch):
     """Route paper.py's HTTP calls through an in-memory fake arXiv."""
-    state = {"feed": ATOM_FEED, "pdf_requests": 0}
+    state = {"feed": ATOM_FEED, "pdf_requests": 0, "meta_requests": 0, "fail_first_n": 0}
     pdf = minimal_pdf_bytes()
 
     def handler(request):
         if request.url.path.startswith("/api/query"):
+            state["meta_requests"] += 1
+            if state["meta_requests"] <= state["fail_first_n"]:
+                return httpx.Response(503)
             return httpx.Response(200, text=state["feed"])
         state["pdf_requests"] += 1
         return httpx.Response(200, content=pdf)
 
     transport = httpx.MockTransport(handler)
-    real_client = httpx.Client
     monkeypatch.setattr(
-        paper_mod.httpx, "Client", lambda **kw: real_client(transport=transport, **kw)
+        paper_mod.httpx, "Client", lambda **kw: REAL_HTTPX_CLIENT(transport=transport, **kw)
     )
+    # Real text extraction is exercised in TestExtractText; the fixture PDF is
+    # a blank page, which would (correctly) be refused as scanned/imagelike.
+    monkeypatch.setattr(paper_mod, "_extract_text", lambda p: "extracted text " * 100)
+    monkeypatch.setattr(retry_mod.time, "sleep", lambda s: None)
     return state
 
 
@@ -78,7 +88,7 @@ class TestFetchPaper:
         assert paper.abstract == "We study a thing."
         assert paper.authors == ["A. Author", "B. Author"]
         assert paper.pdf_path.exists()
-        assert isinstance(paper.full_text, str)  # blank page extracts to empty text
+        assert "extracted text" in paper.full_text
 
     def test_cached_pdf_is_not_redownloaded(self, arxiv_transport, tmp_path):
         fetch_paper("2301.12345", tmp_path)
@@ -89,3 +99,42 @@ class TestFetchPaper:
         arxiv_transport["feed"] = EMPTY_FEED
         with pytest.raises(ValueError, match="no entry"):
             fetch_paper("9999.99999", tmp_path)
+
+    def test_transient_api_errors_are_retried(self, arxiv_transport, tmp_path):
+        arxiv_transport["fail_first_n"] = 2
+        paper = fetch_paper("2301.12345", tmp_path)
+        assert paper.title == "Chaotic Dynamics of a Test System"
+        assert arxiv_transport["meta_requests"] == 3  # two 503s, then success
+
+    def test_persistent_outage_finally_raises(self, arxiv_transport, tmp_path):
+        arxiv_transport["fail_first_n"] = 99
+        with pytest.raises(httpx.HTTPStatusError):
+            fetch_paper("2301.12345", tmp_path)
+
+    def test_client_error_is_not_retried(self, arxiv_transport, monkeypatch, tmp_path):
+        def handler(request):
+            arxiv_transport["meta_requests"] += 1
+            return httpx.Response(404)
+
+        monkeypatch.setattr(
+            paper_mod.httpx,
+            "Client",
+            lambda **kw: REAL_HTTPX_CLIENT(transport=httpx.MockTransport(handler), **kw),
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            fetch_paper("2301.12345", tmp_path)
+        assert arxiv_transport["meta_requests"] == 1
+
+
+class TestExtractText:
+    def test_blank_pdf_is_refused_as_scannedlike(self, tmp_path):
+        pdf = tmp_path / "blank.pdf"
+        pdf.write_bytes(minimal_pdf_bytes())
+        with pytest.raises(PdfExtractionError, match="scanned"):
+            _extract_text(pdf)
+
+    def test_corrupt_pdf_raises_extraction_error_not_pypdf_internals(self, tmp_path):
+        pdf = tmp_path / "corrupt.pdf"
+        pdf.write_bytes(b"%PDF-1.4 this is not really a pdf at all")
+        with pytest.raises(PdfExtractionError):
+            _extract_text(pdf)

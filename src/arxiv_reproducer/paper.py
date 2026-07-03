@@ -10,10 +10,19 @@ from pathlib import Path
 import httpx
 from pypdf import PdfReader
 
+from .retry import retry_with_backoff
+
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_PDF = "https://arxiv.org/pdf/{arxiv_id}"
 
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+
+# Below this, the "text" is almost certainly a scanned/image PDF, not prose.
+MIN_EXTRACTED_CHARS = 500
+
+
+class PdfExtractionError(RuntimeError):
+    """The PDF could not be turned into usable text."""
 
 # Matches both new-style (2301.12345, optionally with version) and
 # old-style (hep-th/9901001) identifiers, bare or inside an arxiv.org URL.
@@ -44,8 +53,16 @@ def fetch_paper(raw_id: str, workdir: Path) -> Paper:
     workdir.mkdir(parents=True, exist_ok=True)
 
     with httpx.Client(timeout=60, follow_redirects=True) as client:
-        meta = client.get(ARXIV_API, params={"id_list": arxiv_id, "max_results": 1})
-        meta.raise_for_status()
+
+        def get(url: str, **kwargs) -> httpx.Response:
+            def once() -> httpx.Response:
+                response = client.get(url, **kwargs)
+                response.raise_for_status()
+                return response
+
+            return retry_with_backoff(once)
+
+        meta = get(ARXIV_API, params={"id_list": arxiv_id, "max_results": 1})
         entry = ET.fromstring(meta.text).find("atom:entry", ATOM_NS)
         if entry is None:
             raise ValueError(f"arXiv API returned no entry for {arxiv_id}")
@@ -57,10 +74,9 @@ def fetch_paper(raw_id: str, workdir: Path) -> Paper:
             for a in entry.findall("atom:author", ATOM_NS)
         ]
 
-        pdf_path = workdir / f"{arxiv_id.replace('/', '_')}.pdf"
+        pdf_path = workdir / "paper.pdf"
         if not pdf_path.exists():
-            pdf = client.get(ARXIV_PDF.format(arxiv_id=arxiv_id))
-            pdf.raise_for_status()
+            pdf = get(ARXIV_PDF.format(arxiv_id=arxiv_id))
             pdf_path.write_bytes(pdf.content)
 
     full_text = _extract_text(pdf_path)
@@ -75,5 +91,23 @@ def fetch_paper(raw_id: str, workdir: Path) -> Paper:
 
 
 def _extract_text(pdf_path: Path) -> str:
-    reader = PdfReader(pdf_path)
-    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    """Extract text, tolerating per-page failures; refuse unusable PDFs."""
+    try:
+        reader = PdfReader(pdf_path)
+        pages = []
+        for page in reader.pages:
+            try:
+                pages.append(page.extract_text() or "")
+            except Exception:  # pypdf page-level parsing is fragile
+                pages.append("")
+        text = "\n\n".join(pages)
+    except PdfExtractionError:
+        raise
+    except Exception as exc:
+        raise PdfExtractionError(f"Could not parse PDF {pdf_path.name}: {exc}") from exc
+    if len(text.strip()) < MIN_EXTRACTED_CHARS:
+        raise PdfExtractionError(
+            f"Extracted only {len(text.strip())} characters from {pdf_path.name} — "
+            "this looks like a scanned/image PDF, which this tool cannot process."
+        )
+    return text
