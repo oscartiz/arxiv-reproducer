@@ -39,7 +39,7 @@ class Usage:
     cache_creation_input_tokens: int = 0
     requests: int = field(default=0)
 
-    def add(self, message_usage) -> None:
+    def add(self, message_usage: object) -> None:
         """Accumulate one API message's usage object (fields may be None)."""
         if message_usage is None:
             return

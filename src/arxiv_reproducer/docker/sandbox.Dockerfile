@@ -4,7 +4,10 @@
 # container gets --network none, so agent-generated code cannot exfiltrate
 # data or phone home. Extra packages are installed by a separate ephemeral
 # container into /workspace/.deps (see sandbox.py), never by this one.
-FROM python:3.12-slim
+# python:3.12-slim pinned by digest so the sandbox base cannot drift or be
+# tag-hijacked. To bump: docker pull python:3.12-slim && docker image inspect
+# python:3.12-slim --format '{{index .RepoDigests 0}}'
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 
 RUN pip install --no-cache-dir \
     numpy \
@@ -17,7 +20,8 @@ RUN pip install --no-cache-dir \
     pillow \
     tqdm
 
-# Non-root user; containers are additionally started with --user 1000:1000,
+# Non-root default user; containers are additionally started with
+# --user <host uid>:<host gid> (so the bind-mounted workspace stays readable),
 # a read-only root filesystem, and all capabilities dropped.
 RUN useradd --create-home --uid 1000 sandbox
 USER sandbox

@@ -13,10 +13,11 @@ import httpx
 from rich.console import Console
 
 from .agent import run_reproduction
+from .config import ConfigError, get_config
 from .logs import setup_logging
 from .paper import PdfExtractionError, fetch_paper, parse_arxiv_id
 from .runs import new_run_dir, safe_dir_name
-from .sandbox import SANDBOX_IMAGE, check_docker, ensure_image, image_exists
+from .sandbox import check_docker, ensure_image, image_exists
 
 
 def has_anthropic_credentials() -> bool:
@@ -57,6 +58,12 @@ def main(argv: list[str] | None = None) -> None:
     setup_logging(verbose=args.verbose, json_logs=args.log_json)
     console = Console()
 
+    try:
+        cfg = get_config()
+    except ConfigError as exc:
+        console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
+
     docker_problem = check_docker()
     if docker_problem is not None:
         console.print(f"[red]{docker_problem}[/red]")
@@ -75,13 +82,13 @@ def main(argv: list[str] | None = None) -> None:
         console.print(f"[red]{exc}[/red]")
         sys.exit(2)
 
-    if not image_exists(SANDBOX_IMAGE):
+    if not image_exists(cfg.sandbox_image):
         console.print(
-            f"[bold]Building sandbox image[/bold] {SANDBOX_IMAGE} "
+            f"[bold]Building sandbox image[/bold] {cfg.sandbox_image} "
             "(first run only — this takes a few minutes) ..."
         )
     try:
-        ensure_image(SANDBOX_IMAGE)
+        ensure_image(cfg.sandbox_image)
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         console.print(f"[red]Failed to build sandbox image:[/red]\n{stderr.strip()[-2000:]}")

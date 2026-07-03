@@ -6,6 +6,7 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 from pypdf import PdfReader
@@ -57,7 +58,7 @@ def fetch_paper(raw_id: str, workdir: Path) -> Paper:
 
     with httpx.Client(timeout=60, follow_redirects=True) as client:
 
-        def get(url: str, **kwargs) -> httpx.Response:
+        def get(url: str, **kwargs: Any) -> httpx.Response:
             def once() -> httpx.Response:
                 response = client.get(url, **kwargs)
                 response.raise_for_status()

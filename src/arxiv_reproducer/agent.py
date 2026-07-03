@@ -10,8 +10,10 @@ from pathlib import Path
 import anthropic
 import httpx
 from anthropic import beta_tool
+from anthropic.lib.tools import BetaFunctionTool
 from rich.console import Console
 
+from .config import get_config
 from .costs import Usage, estimate_cost_usd
 from .logs import get_logger
 from .manifest import section_snippet, verdict_from_report, write_manifest
@@ -20,17 +22,6 @@ from .prompts import SYSTEM_PROMPT, initial_user_message
 from .sandbox import DockerSandbox
 
 logger = get_logger("agent")
-
-MODEL = "claude-opus-4-8"
-MAX_TOKENS = 16_000
-
-# Caps on the whole run, so a confused or adversarially-prompted agent cannot
-# loop forever burning API spend. Per-command timeouts live in sandbox.py.
-MAX_ITERATIONS = 60
-MAX_WALL_CLOCK_SECONDS = 3600
-
-# Anthropic SDK built-in retry handles 429/5xx/connection errors with backoff.
-API_MAX_RETRIES = 5
 
 
 @dataclass
@@ -61,7 +52,7 @@ def _resolve_in_workspace(workdir: Path, path: str) -> Path | None:
     return target
 
 
-def build_tools(sandbox: DockerSandbox):
+def build_tools(sandbox: DockerSandbox) -> list[BetaFunctionTool]:
     """Create the agent's tools, bound to one sandbox instance."""
 
     @beta_tool
@@ -137,18 +128,19 @@ def run_reproduction(paper: Paper, workdir: Path, console: Console) -> RunResult
     Always leaves the workspace in a coherent state: REPORT.md exists when
     this returns, whatever happened mid-run, and the container is torn down.
     """
-    client = anthropic.Anthropic(max_retries=API_MAX_RETRIES)
+    cfg = get_config()
+    client = anthropic.Anthropic(max_retries=cfg.api_max_retries)
     status = "completed"
     error: str | None = None
     iterations = 0
     usage = Usage()
     started_at = datetime.now(timezone.utc)
-    logger.info("run starting: arxiv_id=%s model=%s", paper.arxiv_id, MODEL)
+    logger.info("run starting: arxiv_id=%s model=%s", paper.arxiv_id, cfg.model)
 
     with DockerSandbox(workdir) as sandbox:
         runner = client.beta.messages.tool_runner(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
+            model=cfg.model,
+            max_tokens=cfg.max_tokens,
             thinking={"type": "adaptive"},
             system=SYSTEM_PROMPT,
             tools=build_tools(sandbox),
@@ -180,19 +172,19 @@ def run_reproduction(paper: Paper, workdir: Path, console: Console) -> RunResult
                         console.print(block.text)
                     elif block.type == "tool_use":
                         console.print(f"[dim]→ {block.name}[/dim]")
-                if iterations >= MAX_ITERATIONS:
+                if iterations >= cfg.max_iterations:
                     status = "iteration_cap"
                     logger.warning("iteration cap reached at %d", iterations)
                     console.print(
-                        f"[yellow]Stopping: iteration cap reached ({MAX_ITERATIONS}).[/yellow]"
+                        f"[yellow]Stopping: iteration cap reached ({cfg.max_iterations}).[/yellow]"
                     )
                     break
-                if time.monotonic() - started > MAX_WALL_CLOCK_SECONDS:
+                if time.monotonic() - started > cfg.max_wall_clock_seconds:
                     status = "wall_clock_cap"
                     logger.warning("wall-clock cap reached after %d iterations", iterations)
                     console.print(
                         f"[yellow]Stopping: wall-clock cap reached "
-                        f"({MAX_WALL_CLOCK_SECONDS}s).[/yellow]"
+                        f"({cfg.max_wall_clock_seconds}s).[/yellow]"
                     )
                     break
         except (anthropic.APIError, httpx.HTTPError) as exc:
@@ -215,16 +207,16 @@ def run_reproduction(paper: Paper, workdir: Path, console: Console) -> RunResult
             lines += ["", f"Error: {error}"]
         report.write_text("\n".join(lines) + "\n")
 
-    cost = estimate_cost_usd(usage, MODEL)
+    cost = estimate_cost_usd(usage, cfg.model)
     report_text = report.read_text()
-    _append_run_metadata(report, status, iterations, wall_clock, usage, cost)
+    _append_run_metadata(report, cfg.model, status, iterations, wall_clock, usage, cost)
 
     manifest = write_manifest(
         workdir,
         {
             "arxiv_id": paper.arxiv_id,
             "title": paper.title,
-            "model": MODEL,
+            "model": cfg.model,
             "status": status,
             "error": error,
             "verdict": verdict_from_report(report_text),
@@ -256,6 +248,7 @@ def run_reproduction(paper: Paper, workdir: Path, console: Console) -> RunResult
 
 def _append_run_metadata(
     report: Path,
+    model: str,
     status: str,
     iterations: int,
     wall_clock: float,
@@ -267,7 +260,7 @@ def _append_run_metadata(
     report_footer = (
         "\n\n---\n\n## Run metadata\n\n"
         f"- Status: {status}\n"
-        f"- Model: {MODEL}\n"
+        f"- Model: {model}\n"
         f"- Iterations: {iterations}\n"
         f"- Wall clock: {wall_clock:.1f} s\n"
         f"- Tokens: {usage.input_tokens} in / {usage.output_tokens} out / "

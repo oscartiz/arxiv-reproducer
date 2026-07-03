@@ -19,27 +19,22 @@ into /workspace/.deps — agent code never runs with network access.
 from __future__ import annotations
 
 import atexit
+import os
 import re
 import shutil
 import signal
 import subprocess
 import uuid
+from types import FrameType
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
+from .config import get_config
 from .logs import get_logger
 
 logger = get_logger("sandbox")
 
-SANDBOX_IMAGE = "arxiv-repro-sandbox:latest"
-EXEC_TIMEOUT = 600  # seconds per command
-INSTALL_TIMEOUT = 300  # seconds per pip install
-
-MEMORY_LIMIT = "4g"
-CPU_LIMIT = "2"
-PIDS_LIMIT = "256"
-TMP_SIZE = "512m"
 DEPS_DIR = ".deps"  # inside /workspace; importable via PYTHONPATH
 
 # PEP 508-ish subset: name, optional extras, optional version pin. No flags,
@@ -71,13 +66,15 @@ def sandbox_dockerfile() -> str:
     return resources.files("arxiv_reproducer").joinpath("docker/sandbox.Dockerfile").read_text()
 
 
-def image_exists(image: str = SANDBOX_IMAGE) -> bool:
+def image_exists(image: str | None = None) -> bool:
+    image = image or get_config().sandbox_image
     probe = subprocess.run(["docker", "image", "inspect", image], capture_output=True)
     return probe.returncode == 0
 
 
-def ensure_image(image: str = SANDBOX_IMAGE) -> None:
+def ensure_image(image: str | None = None) -> None:
     """Build the sandbox image from the packaged Dockerfile if it is missing."""
+    image = image or get_config().sandbox_image
     if image_exists(image):
         return
     logger.info("building sandbox image %s", image)
@@ -123,7 +120,7 @@ def _install_cleanup_hooks() -> None:
 
     previous = signal.getsignal(signal.SIGTERM)
 
-    def on_sigterm(signum, frame):
+    def on_sigterm(signum: int, frame: FrameType | None) -> None:
         _cleanup_all_containers()
         if callable(previous):
             previous(signum, frame)
@@ -154,26 +151,40 @@ class ExecResult:
 @dataclass
 class DockerSandbox:
     workdir: Path
-    image: str = SANDBOX_IMAGE
+    image: str = ""  # empty → config's sandbox_image
     name: str = field(default_factory=lambda: f"arxiv-repro-{uuid.uuid4().hex[:12]}")
     installed_packages: list[str] = field(default_factory=list)
     _started: bool = field(default=False, repr=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.workdir = Path(self.workdir).resolve()
+        if not self.image:
+            self.image = get_config().sandbox_image
+
+    @staticmethod
+    def _container_user() -> str:
+        """The container runs as the invoking host user so it can read the
+        bind-mounted workspace (host-created files keep the host owner's uid on
+        Linux). When invoked as root, fall back to the image's unprivileged
+        user — running the sandbox as root is never acceptable."""
+        uid, gid = os.getuid(), os.getgid()
+        if uid == 0:
+            return "1000:1000"
+        return f"{uid}:{gid}"
 
     def _hardening_flags(self) -> list[str]:
         """Flags shared by the exec container and the ephemeral installer."""
+        cfg = get_config()
         return [
-            "--memory", MEMORY_LIMIT,
-            "--memory-swap", MEMORY_LIMIT,  # equal to --memory: no swap
-            "--cpus", CPU_LIMIT,
-            "--pids-limit", PIDS_LIMIT,
+            "--memory", cfg.memory_limit,
+            "--memory-swap", cfg.memory_limit,  # equal to --memory: no swap
+            "--cpus", cfg.cpu_limit,
+            "--pids-limit", str(cfg.pids_limit),
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
-            "--user", "1000:1000",
+            "--user", self._container_user(),
             "--read-only",
-            "--tmpfs", f"/tmp:rw,noexec,nosuid,size={TMP_SIZE}",
+            "--tmpfs", f"/tmp:rw,noexec,nosuid,size={cfg.tmp_size}",
             "-e", "HOME=/tmp",
             "-e", "MPLBACKEND=Agg",
             "-e", "MPLCONFIGDIR=/tmp/mpl",
@@ -202,9 +213,10 @@ class DockerSandbox:
         _ACTIVE_CONTAINERS.add(self.name)
         logger.info("container %s started (image=%s, workdir=%s)", self.name, self.image, self.workdir)
 
-    def exec(self, command: list[str], timeout: int = EXEC_TIMEOUT) -> ExecResult:
+    def exec(self, command: list[str], timeout: int | None = None) -> ExecResult:
         if not self._started:
             raise RuntimeError("Sandbox not started — call start() first")
+        timeout = timeout if timeout is not None else get_config().exec_timeout
         logger.debug("exec in %s: %s", self.name, " ".join(command))
         try:
             proc = subprocess.run(
@@ -217,7 +229,7 @@ class DockerSandbox:
         except subprocess.TimeoutExpired:
             return ExecResult(-1, "", f"Command timed out after {timeout}s")
 
-    def run_python_file(self, relpath: str, timeout: int = EXEC_TIMEOUT) -> ExecResult:
+    def run_python_file(self, relpath: str, timeout: int | None = None) -> ExecResult:
         return self.exec(["python", relpath], timeout=timeout)
 
     def pip_install(self, packages: list[str]) -> ExecResult:
@@ -232,6 +244,7 @@ class DockerSandbox:
             logger.warning("refused pip install: %s", problem)
             return ExecResult(2, "", f"Refused: {problem}")
         logger.info("pip install (networked installer): %s", " ".join(packages))
+        install_timeout = get_config().install_timeout
         try:
             proc = subprocess.run(
                 [
@@ -247,10 +260,10 @@ class DockerSandbox:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=INSTALL_TIMEOUT,
+                timeout=install_timeout,
             )
         except subprocess.TimeoutExpired:
-            return ExecResult(-1, "", f"pip install timed out after {INSTALL_TIMEOUT}s")
+            return ExecResult(-1, "", f"pip install timed out after {install_timeout}s")
         if proc.returncode == 0:
             self.installed_packages.extend(packages)
         return ExecResult(proc.returncode, proc.stdout, proc.stderr)
@@ -266,5 +279,5 @@ class DockerSandbox:
         self.start()
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.stop()

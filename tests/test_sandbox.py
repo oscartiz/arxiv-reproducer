@@ -1,3 +1,4 @@
+import os
 import subprocess
 
 import pytest
@@ -77,7 +78,9 @@ class TestLifecycle:
         # Privilege reduction.
         assert argv[argv.index("--cap-drop") + 1] == "ALL"
         assert argv[argv.index("--security-opt") + 1] == "no-new-privileges"
-        assert argv[argv.index("--user") + 1] == "1000:1000"
+        user = argv[argv.index("--user") + 1]
+        assert user == f"{os.getuid()}:{os.getgid()}"
+        assert not user.startswith("0:")
         # Fork bombs and swap thrash are capped.
         assert "--pids-limit" in argv
         assert "--memory-swap" in argv
@@ -197,7 +200,7 @@ class TestPipInstall:
         assert f"/workspace/{DEPS_DIR}" in argv[argv.index("--target") + 1]
         # Same privilege reduction as the exec container.
         assert argv[argv.index("--cap-drop") + 1] == "ALL"
-        assert argv[argv.index("--user") + 1] == "1000:1000"
+        assert argv[argv.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
         # But NOT --network none — this is the sanctioned install phase.
         assert "none" not in argv
         assert argv[-2:] == ["statsmodels", "emcee==3.1.4"]
@@ -374,7 +377,8 @@ class TestRealDocker:
     def test_runs_as_non_root_with_read_only_rootfs(self, tmp_path):
         with DockerSandbox(tmp_path) as sb:
             uid = sb.exec(["python", "-c", "import os; print(os.getuid())"])
-            assert uid.stdout.strip() == "1000"
+            assert uid.stdout.strip() == str(os.getuid())
+            assert uid.stdout.strip() != "0"
             poke = sb.exec(["python", "-c", "open('/etc/pwned', 'w')"])
             assert poke.exit_code != 0
 
