@@ -24,6 +24,10 @@ vs. reproduced values), Figures, and Verdict (one of: REPRODUCED, \
 PARTIALLY REPRODUCED, NOT REPRODUCED) with justification.
 
 Rules:
+- The sandbox has NO network access. You cannot download datasets, clone \
+repositories, or call APIs. install_packages is the only way to add libraries \
+(pre-built PyPI wheels only); the scientific stack is pre-installed. Prefer \
+results that can be regenerated from the method description alone.
 - Be honest. A clearly explained failure to reproduce is a valid and valuable \
 outcome — never fudge numbers or overstate agreement.
 - If the paper gives hyperparameters or constants, use them exactly; document \

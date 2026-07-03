@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import anthropic
@@ -14,6 +15,11 @@ from .sandbox import DockerSandbox
 
 MODEL = "claude-opus-4-8"
 MAX_TOKENS = 16_000
+
+# Caps on the whole run, so a confused or adversarially-prompted agent cannot
+# loop forever burning API spend. Per-command timeouts live in sandbox.py.
+MAX_ITERATIONS = 60
+MAX_WALL_CLOCK_SECONDS = 3600
 
 
 MAX_READ_CHARS = 50_000
@@ -89,8 +95,13 @@ def build_tools(sandbox: DockerSandbox):
     def install_packages(packages: str) -> str:
         """Install Python packages into the sandbox with pip.
 
+        Only plain PyPI package names with optional version pins are accepted
+        (pre-built wheels only — no URLs, flags, or source builds). The
+        scientific stack (numpy, scipy, matplotlib, pandas, sympy,
+        scikit-learn, networkx, pillow) is already installed.
+
         Args:
-            packages: Space-separated package names, e.g. "numpy scipy matplotlib".
+            packages: Space-separated package names, e.g. "statsmodels emcee".
         """
         return sandbox.pip_install(packages.split()).render()
 
@@ -126,12 +137,23 @@ def run_reproduction(paper: Paper, workdir: Path, console: Console) -> Path:
             ],
         )
 
-        for message in runner:
+        started = time.monotonic()
+        for iteration, message in enumerate(runner, start=1):
             for block in message.content:
                 if block.type == "text":
                     console.print(block.text)
                 elif block.type == "tool_use":
                     console.print(f"[dim]→ {block.name}[/dim]")
+            if iteration >= MAX_ITERATIONS:
+                console.print(
+                    f"[yellow]Stopping: iteration cap reached ({MAX_ITERATIONS}).[/yellow]"
+                )
+                break
+            if time.monotonic() - started > MAX_WALL_CLOCK_SECONDS:
+                console.print(
+                    f"[yellow]Stopping: wall-clock cap reached ({MAX_WALL_CLOCK_SECONDS}s).[/yellow]"
+                )
+                break
 
     report = workdir / "REPORT.md"
     if not report.exists():

@@ -10,8 +10,10 @@ from arxiv_reproducer.paper import Paper
 
 @pytest.fixture
 def ready_environment(monkeypatch, tmp_path):
-    """Docker up, credentials present — the default happy baseline."""
+    """Docker up, image built, credentials present — the happy baseline."""
     monkeypatch.setattr(cli_mod, "check_docker", lambda: None)
+    monkeypatch.setattr(cli_mod, "image_exists", lambda image=None: True)
+    monkeypatch.setattr(cli_mod, "ensure_image", lambda image=None: None)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     return tmp_path
 
@@ -59,6 +61,26 @@ class TestArgumentAndPreflightErrors:
             main(["2301.12345"])
         assert excinfo.value.code == 1
         assert "ANTHROPIC_API_KEY" in capsys.readouterr().out
+
+
+class TestImagePreflight:
+    def test_build_failure_is_reported_cleanly(self, monkeypatch, capsys):
+        import subprocess
+
+        monkeypatch.setattr(cli_mod, "check_docker", lambda: None)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        monkeypatch.setattr(cli_mod, "image_exists", lambda image=None: False)
+
+        def boom(image=None):
+            raise subprocess.CalledProcessError(1, ["docker", "build"], stderr=b"build exploded")
+
+        monkeypatch.setattr(cli_mod, "ensure_image", boom)
+        with pytest.raises(SystemExit) as excinfo:
+            main(["2301.12345"])
+        assert excinfo.value.code == 1
+        out = capsys.readouterr().out
+        assert "Building sandbox image" in out  # first-run notice
+        assert "build exploded" in out
 
 
 class TestFetchFailures:
