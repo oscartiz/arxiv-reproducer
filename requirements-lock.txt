@@ -8,6 +8,8 @@ anyio==4.14.1
     # via
     #   anthropic
     #   httpx
+ast-serialize==0.6.0
+    # via mypy
 certifi==2026.6.17
     # via
     #   httpcore
@@ -36,12 +38,20 @@ iniconfig==2.3.0
     # via pytest
 jiter==0.16.0
     # via anthropic
+librt==0.12.0 ; platform_python_implementation != 'PyPy'
+    # via mypy
 markdown-it-py==4.2.0
     # via rich
 mdurl==0.1.2
     # via markdown-it-py
+mypy==2.1.0
+    # via arxiv-reproducer (pyproject.toml)
+mypy-extensions==1.1.0
+    # via mypy
 packaging==26.2
     # via pytest
+pathspec==1.1.1
+    # via mypy
 pluggy==1.6.0
     # via
     #   pytest
@@ -74,6 +84,7 @@ typing-extensions==4.16.0
     # via
     #   anthropic
     #   anyio
+    #   mypy
     #   pydantic
     #   pydantic-core
     #   typing-inspection

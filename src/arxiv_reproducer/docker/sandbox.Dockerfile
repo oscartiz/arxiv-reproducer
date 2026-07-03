@@ -20,7 +20,8 @@ RUN pip install --no-cache-dir \
     pillow \
     tqdm
 
-# Non-root user; containers are additionally started with --user 1000:1000,
+# Non-root default user; containers are additionally started with
+# --user <host uid>:<host gid> (so the bind-mounted workspace stays readable),
 # a read-only root filesystem, and all capabilities dropped.
 RUN useradd --create-home --uid 1000 sandbox
 USER sandbox

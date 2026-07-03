@@ -19,6 +19,7 @@ into /workspace/.deps — agent code never runs with network access.
 from __future__ import annotations
 
 import atexit
+import os
 import re
 import shutil
 import signal
@@ -160,6 +161,17 @@ class DockerSandbox:
         if not self.image:
             self.image = get_config().sandbox_image
 
+    @staticmethod
+    def _container_user() -> str:
+        """The container runs as the invoking host user so it can read the
+        bind-mounted workspace (host-created files keep the host owner's uid on
+        Linux). When invoked as root, fall back to the image's unprivileged
+        user — running the sandbox as root is never acceptable."""
+        uid, gid = os.getuid(), os.getgid()
+        if uid == 0:
+            return "1000:1000"
+        return f"{uid}:{gid}"
+
     def _hardening_flags(self) -> list[str]:
         """Flags shared by the exec container and the ephemeral installer."""
         cfg = get_config()
@@ -170,7 +182,7 @@ class DockerSandbox:
             "--pids-limit", str(cfg.pids_limit),
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
-            "--user", "1000:1000",
+            "--user", self._container_user(),
             "--read-only",
             "--tmpfs", f"/tmp:rw,noexec,nosuid,size={cfg.tmp_size}",
             "-e", "HOME=/tmp",
