@@ -209,6 +209,7 @@ arxiv-reproducer/
 │   └── docker/
 │       └── sandbox.Dockerfile   # pre-baked scientific image, digest-pinned base
 ├── tests/                   # full suite runs with no Docker and no API key
+├── paper/                   # the working-draft paper (LaTeX; CI builds the PDF)
 ├── arxiv-repro.example.toml # every config key, documented
 ├── requirements-lock.txt    # universal lockfile (uv) — CI installs from this
 ├── Makefile                 # install / test / integration / lint / typecheck / check
@@ -271,6 +272,10 @@ Poor candidates: anything needing proprietary data, large-scale training, or phy
 | Paper | Target result | Verdict | Report |
 |---|---|---|---|
 | — | — | — | — |
+
+## The paper
+
+The methodology and system are written up in a working draft — *Reproduce — or Say Why Not: An Auditable LLM Agent for Text-Only Reproduction of Computational Results* — under [`paper/`](paper/). It covers what text-only reproduction measures, the treat-the-paper-as-adversary threat model, the honesty protocol (three-valued verdicts, mandatory deltas, calibrated confidence), and the pre-stated evaluation plan; deliberately, it contains no headline numbers until the funded gallery runs land. `make paper` builds the PDF locally; CI compiles it on every push and uploads it as the `paper-pdf` artifact.
 
 ## Roadmap
 

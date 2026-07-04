@@ -1,0 +1,178 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!60!black,citecolor=blue!60!black,urlcolor=blue!60!black]{hyperref}
+\usepackage{microtype}
+
+\newcommand{\system}{\texttt{arxiv-reproducer}}
+\newcommand{\verdict}[1]{\textsc{#1}}
+
+\title{Reproduce --- or Say Why Not:\\
+An Auditable LLM Agent for Text-Only Reproduction\\
+of Computational Results}
+
+\author{Oscar Tiznado\\
+\small\href{https://github.com/oscartiz/arxiv-reproducer}{\texttt{github.com/oscartiz/arxiv-reproducer}}}
+
+\date{July 2026 --- working draft}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Most published computational results are never independently re-derived: reproduction is slow, unglamorous, and unrewarded, so it rarely happens. Yet much of what a reproduction attempt requires --- reading a method section, translating it into code, running it, and comparing numbers --- is exactly the kind of work that large language model (LLM) agents now do competently. We present \system{}, an open-source agent that, given only an arXiv identifier, selects a feasibly reproducible quantitative result from the paper, re-implements the method \emph{from the paper text alone} inside a network-isolated sandbox, and issues one of three verdicts --- \verdict{Reproduced}, \verdict{Partially Reproduced}, or \verdict{Not Reproduced} --- together with a calibrated confidence and a fully auditable workspace containing every script, figure, and token of the attempt. The system is built around three commitments that distinguish it from a demonstration: (i)~\emph{failure is a first-class outcome}: the agent is instructed, and the artifact format is designed, so that ``here is exactly where the paper's description was insufficient'' is a valued result rather than a defect; (ii)~\emph{everything is auditable}: a verdict is only a pointer into a preserved, re-runnable workspace; and (iii)~\emph{the paper is untrusted input}: reproduction targets are documents that can attack the agent, so agent-authored code executes without network access, without privileges, and under strict resource caps. We describe the architecture, the threat model, the verdict and confidence protocol, and a batch-screening mode that turns single reproductions into reproducibility surveys with per-paper cost accounting. We release the system under the MIT license and outline the evaluation now in progress; this draft deliberately reports no headline success rates, because the interesting scientific output of a reproduction agent is not its success rate but the distribution of \emph{deltas} between what papers say and what their text suffices to regenerate.
+\end{abstract}
+
+\section{Introduction}
+
+Reproducibility is one of science's quietest crises. Surveys across fields report that a majority of researchers have failed to reproduce another group's result, and a substantial fraction have failed to reproduce their own~\cite{baker2016}. Systematic efforts in psychology~\cite{osc2015} and cancer biology~\cite{errington2021} found reproduction rates far below what readers of the literature might assume, and in computer science --- the field with the fewest physical excuses --- a large-scale study found that the code behind published systems papers frequently cannot even be built~\cite{collberg2016}. Machine learning has its own well-documented variants of the problem~\cite{gundersen2018,pineau2021,kapoor2023}.
+
+The economics of the crisis are straightforward: verification is expensive, skilled, and unrewarded. A careful reproduction of a computational paper takes an expert days; it earns no publication and no citation. The result is a literature that is, in expectation, unverified.
+
+LLM agents change the cost side of this equation. Reading a method section, implementing it, debugging the implementation, and comparing outputs against reported values is precisely the loop that modern tool-using language models execute well --- and their time costs dollars, not careers. This paper asks the question seriously: \emph{what would it take for autonomous reproduction to be trustworthy enough to be useful?}
+
+Our answer is that the hard part is not making an agent that sometimes reproduces a result. It is making a system whose \emph{negative} outputs are meaningful and whose \emph{positive} outputs can be checked. An agent that returns ``reproduced!'' is worth nothing unless the claim is auditable; an agent that returns ``not reproduced'' is worth nothing unless the failure is attributable to the paper rather than to the agent's own limitations, and honestly labelled when it is not. \system{} is our attempt to engineer both properties in, from the artifact format up.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item \textbf{A methodology: text-only reproduction as a measure of communicative reproducibility.} The agent never looks at the authors' code. Re-running a released repository tests whether the \emph{artifact} still runs; re-implementing from the paper text tests whether the \emph{paper} communicates the method --- which is the question peer review pretends to answer (\S\ref{sec:textonly}).
+  \item \textbf{An open-source, security-hardened system embodying it.} A three-layer pipeline (acquisition, agent loop, sandbox) in which papers are treated as adversarial input: agent-authored code runs with no network, no privileges, a read-only root filesystem, and hard resource caps, and every run --- including crashed, capped, and interrupted runs --- terminates in a coherent, machine-readable state (\S\ref{sec:system}).
+  \item \textbf{An honesty protocol.} A three-valued verdict with mandatory quantified discrepancies, a calibrated confidence attached to every verdict, prompt-level rules that reward documented failure, and an artifact format in which the verdict is a claim about a preserved workspace that anyone can re-run (\S\ref{sec:honesty}).
+  \item \textbf{A survey instrument.} A batch-screening mode that runs paper lists unattended, survives per-paper failures, and emits a spreadsheet of verdicts, confidences, and dollar costs --- the substrate for reproducibility surveys at corpus scale (\S\ref{sec:batch}).
+\end{enumerate}
+
+We also state what this draft does \emph{not} contain: empirical results. The system is complete and continuously tested (unit suite plus a real-Docker integration suite that re-proves the sandbox guarantees in CI), and a funded evaluation over computational-physics papers is in progress (\S\ref{sec:eval}). We consider publishing the methodology before the numbers to be part of the honesty protocol rather than a shortcut: the evaluation plan below is falsifiable and pre-stated.
+
+\section{Related Work}\label{sec:related}
+
+\paragraph{The reproducibility literature.} Large-scale manual efforts quantified the crisis in psychology~\cite{osc2015} and cancer biology~\cite{errington2021}; Baker's survey~\cite{baker2016} documented its breadth. In computing, Collberg and Proebsting~\cite{collberg2016} studied \emph{repeatability} --- whether released code builds and runs --- while work in ML has examined what paper metadata predicts independent reproduction~\cite{raff2019}, proposed reproducibility checklists~\cite{pineau2021}, and catalogued leakage-driven irreproducibility across the sciences~\cite{kapoor2023}. Our system operationalizes a complementary quantity: not whether artifacts persist, but whether prose suffices.
+
+\paragraph{Agent benchmarks for reproduction.} Several benchmarks evaluate LLM agents on reproduction-shaped tasks: CORE-Bench~\cite{siegel2024} scores agents on reproducing results \emph{given the authors' code}; SUPER~\cite{bogin2024} on setting up and executing tasks from research repositories; MLAgentBench~\cite{huang2024} on ML experimentation; PaperBench~\cite{starace2025} on replicating AI papers from scratch, with author-written grading rubrics. These efforts measure \emph{agent capability} against known-reproducible targets. \system{} inverts the direction of measurement: the agent is the (imperfect, versioned, cost-accounted) instrument, and the \emph{papers} are the object of study. The two directions are complementary, and capability benchmarks calibrate how much of a \verdict{Not Reproduced} to attribute to the instrument.
+
+\paragraph{Prompt injection and agent security.} Documents that manipulate the LLM that reads them are a demonstrated, practical attack~\cite{greshake2023}. Reproduction is an unusual deployment in that the \emph{primary input is by construction an untrusted third-party document that the agent must obey deeply} --- it exists to follow the paper's instructions. Our security posture therefore assumes the agent \emph{will} sometimes act under adversarial influence and bounds the blast radius mechanically (\S\ref{sec:threat}) rather than hoping to filter the influence out.
+
+\section{What Text-Only Reproduction Measures}\label{sec:textonly}
+
+A reproduction protocol must first decide what it feeds the reproducer. We deliberately provide the agent with the paper's extracted full text (and its figures, for visual comparison) and nothing else: no author code, no supplementary repositories, no web access.
+
+This choice defines the measured quantity. If the authors' code is available, a ``reproduction'' collapses into repeatability --- valuable, but a statement about artifact preservation and dependency archaeology, not about the science's communicability. When the method must be re-derived from prose, a successful run certifies something stronger: \emph{the paper's description, alone, determines the result} (to the reported precision, at the attempted scale). A failure localizes to one of a small set of causes that the report must distinguish: a missing hyperparameter, an ambiguous equation, an unstated preprocessing step, an infeasible compute budget, or the agent's own limitations.
+
+Text-only reproduction also sidesteps an entire failure class that says nothing about the science (bit-rotted dependencies, vanished datasets, undocumented build systems), and it is what makes the protocol applicable to the large majority of papers that release no code at all.
+
+The unit of work is deliberately \emph{one result per run}, chosen by the agent under an explicit feasibility triage: prefer analytical and numerical results, small simulations, and synthetic-benchmark experiments; refuse targets requiring proprietary data, long training, or hardware. ``Nothing in this paper is feasibly reproducible in this sandbox, because $X$'' is a valid, recorded outcome --- a classification, not a failure of the instrument.
+
+\section{System Design}\label{sec:system}
+
+\system{} is a $\sim$1{,}500-line Python system with three deliberately decoupled layers.
+
+\subsection{Pipeline}
+
+\textbf{Acquisition.} Paper metadata comes from the arXiv Atom API and full text from the PDF via \texttt{pypdf}; transient HTTP failures retry with exponential backoff and jitter, and a PDF that yields almost no text (a scanned paper) is refused up front rather than fed to the agent as garbage. The paper's own raster figures are extracted from the PDF into the workspace (\texttt{paper-figures/}) so reports can show the original beside the regenerated figure; extraction is strictly best-effort and can never fail a run.
+
+\textbf{Agent loop.} A Claude tool-use loop (Anthropic SDK tool runner, adaptive thinking) with exactly four tools, all scoped to the run's workspace: \texttt{write\_file}, \texttt{read\_file}, \texttt{run\_python}, and \texttt{install\_packages}. Both file tools resolve paths and reject anything escaping the workspace root, symlinks included. The loop is bounded by an iteration cap and a wall-clock cap and accumulates per-message token usage for the final accounting. The full paper text sits at the front of the conversation under a prompt-cache breakpoint, cutting the dominant input-token cost by roughly an order of magnitude across a long run.
+
+\textbf{Sandbox.} Execution happens in a long-lived container built from a pre-baked image (scientific stack installed at build time on a digest-pinned base), so at run time the container needs \emph{no network at all}. The container persists across tool calls within a run --- installs and intermediate files survive --- and is destroyed at the end, with teardown guaranteed by context manager, \texttt{atexit}, and signal hooks.
+
+\subsection{The paper is the adversary}\label{sec:threat}
+
+The threat model treats the paper as untrusted input and the code the agent writes under the paper's influence as untrusted output. A malicious ``paper'' is an indirect prompt injection vector~\cite{greshake2023} aimed at a system that, by design, does what documents tell it to do. We therefore enforce guarantees mechanically, in the execution layer, where the model cannot negotiate them:
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Guarantee} & \textbf{Mechanism} \\
+\midrule
+No network & \texttt{--network none}; code cannot exfiltrate or phone home \\
+No privileges & non-root user, \texttt{--cap-drop ALL}, \texttt{no-new-privileges} \\
+No host writes & read-only rootfs; writable only at the bind-mounted workspace \\
+ & and a size-capped \texttt{noexec} \texttt{/tmp} tmpfs \\
+No runaways & memory / CPU / pid limits; per-command timeouts; output \\
+ & truncated before it reaches the model \\
+No leaks & teardown via context manager + \texttt{atexit} + \texttt{SIGTERM} hooks \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Package installation is the one operation that legitimately needs the network, so it is \emph{two-phase}: \texttt{install\_packages} runs in a separate, ephemeral container that has network access but executes only a validated \texttt{pip install --only-binary=:all:} --- plain PyPI names with optional version pins; URLs, flags, and source builds are refused before Docker is invoked --- into a directory that the offline execution container imports read-only via \texttt{PYTHONPATH}. Agent-authored code never runs with network access and never executes on the host. None of the hardening flags are configuration: resource caps are tunable, isolation is not.
+
+\subsection{Every run ends in a coherent state}
+
+A survey instrument that occasionally strands a hung container or a half-written directory poisons every batch it participates in. \system{} guarantees that however a run ends --- completed, iteration-capped, wall-clock-capped, API failure after SDK retries, or \texttt{Ctrl-C} --- the container is gone, \texttt{REPORT.md} exists (the agent's, or a stub stating exactly what happened and when), and a machine-readable \texttt{run.json} manifest records the status. Each run gets a fresh timestamped workspace; prior runs are never clobbered; a rerun reuses the cached PDF.
+
+\subsection{Cost is part of the result}
+
+Every run accounts its tokens by category (input, output, cache read, cache write) and converts them to a dollar estimate that is printed at the end of the run, appended to the report, and recorded in the manifest. This is not bookkeeping vanity: the viability of agentic reproduction as an institution depends on the ratio of dollars per verdict to the value of a verdict, so the denominator must be measured, per paper, always.
+
+\section{The Honesty Protocol}\label{sec:honesty}
+
+The failure mode we engineer against is \emph{optimistic agreement}: an agent that wants to please will fudge a constant, smooth over a divergent tail, or declare victory at qualitative similarity. Three mechanisms push back.
+
+\subsection{Verdicts with mandatory deltas}
+
+Reports end in one of three verdicts. \verdict{Reproduced}: the paper-reported values were regenerated within stated tolerances. \verdict{Partially Reproduced}: some targets matched, or agreement is qualitative but quantified discrepancies remain. \verdict{Not Reproduced}: the implemented method, as described, does not yield the reported result. Every verdict must be justified by a results-comparison table of paper-reported versus regenerated values with relative errors, and the report must document every assumption made where the paper was ambiguous and every compute scale-down with its expected effect. The prompt states, verbatim, that a clearly explained failure is a valid and valuable outcome and that numbers are never to be fudged. The \emph{Implementation Notes} section --- the list of decisions the paper forced the reproducer to make --- is in our experience the most scientifically interesting artifact: it is a map of exactly where the prose underdetermines the method.
+
+\subsection{Calibrated confidence}
+
+Every verdict carries a self-reported confidence in the exact form \texttt{Confidence: NN\%}, defined in the prompt as the probability that a domain expert auditing the workspace would agree with the verdict, with explicit instructions that ambiguity, scale-downs, and qualitative-only agreement warrant lower values, and that a 90\% should be wrong one time in ten. The confidence is parsed into the manifest. On its own, a self-reported confidence is a soft signal; attached to an auditable workspace and accumulated over a gallery with human review, it becomes measurable: the evaluation plan (\S\ref{sec:eval}) includes a calibration curve of stated confidence against audited correctness, which is only computable because every verdict ships with both a probability and the evidence.
+
+\subsection{Auditability by construction}
+
+The verdict is the weakest artifact a run produces; it is also the only one a reader could be asked to trust blindly, so the design ensures no one has to. The preserved workspace contains the PDF the agent saw, every script it wrote, every figure it generated, the paper's own extracted figures for side-by-side comparison, the full report, and the manifest. Scripts are required to be small and re-runnable; the sandbox image is digest-pinned, so ``re-run what the agent ran'' is a well-defined operation. The intended unit of publication is not the verdict but the \emph{workspace} --- our gallery format promotes runs verbatim, and its checklist rejects a thin \verdict{Reproduced} while accepting a well-argued \verdict{Not Reproduced}.
+
+\section{From Runs to Surveys}\label{sec:batch}
+
+Single reproductions answer questions about papers; distributions answer questions about fields. The batch mode accepts any number of arXiv IDs (arguments and/or an ID file), runs the full pipeline per paper unattended, and treats per-paper failure as data: a paper that fails to fetch or parse becomes a spreadsheet row with an error, never a dead batch. The output is a CSV and markdown table --- verdict, confidence, status, target result, iterations, wall clock, dollars, report path per paper --- plus aggregate verdict counts and total cost. The exit code signals only total failure. With per-paper costs on the order of single-digit dollars, dominated by cached input tokens and debug iterations, a hundred-paper survey of a subfield's communicative reproducibility is a weekend of wall clock and a modest grant line --- a regime in which the calibration measurement above becomes statistically meaningful.
+
+\section{Evaluation Plan and Current Status}\label{sec:eval}
+
+\textbf{Status.} All system components described here are implemented, merged, and exercised in CI: a unit suite (no Docker, no API key, $\sim$95\% branch coverage) and an integration suite that builds the sandbox image and re-proves the container guarantees --- network isolation, non-root with read-only rootfs, two-phase install, teardown --- against a live Docker daemon on every push.
+
+\textbf{Planned evaluation.} The first funded evaluation targets computational physics, where reproduction targets are cleanest and verdicts easiest to audit, starting with small-scale Monte Carlo and dynamical-systems papers. Pre-stated measurements: (i)~the verdict distribution over a fixed, pre-registered paper list; (ii)~a taxonomy of deltas from the Implementation Notes and Results Comparison sections (missing hyperparameters vs.\ ambiguous method vs.\ infeasible compute vs.\ agent failure, the last audited by a human); (iii)~a calibration curve of stated confidence against human-audited verdict correctness; (iv)~cost per verdict, by verdict. Runs will be published verbatim in the repository gallery, including failures. We commit to reporting the agent-failure rate alongside any paper-level claims: without benchmarking the instrument against known-reproducible targets (in the spirit of~\cite{siegel2024,starace2025}), \verdict{Not Reproduced} counts are upper bounds on the papers' fault, not point estimates.
+
+\section{Limitations}\label{sec:limits}
+
+\emph{The instrument is fallible and versioned.} A \verdict{Not Reproduced} conflates paper insufficiency with agent insufficiency; the human-audit arm of the evaluation exists to separate them, and every manifest records the exact model used, so results are statements about a (paper, model) pair. \emph{One result per paper.} Feasibility triage selects the easiest defensible target, which biases surveys toward each paper's most reproducible corner --- appropriate for a lower bound on communicative failure, not an estimate of full-paper reproducibility. \emph{Sandbox scope.} CPU-only Python with a pinned scientific stack excludes GPU training, other languages, and results needing large data; scale-downs are documented but change what ``reproduced'' means for compute-sensitive quantities. \emph{PDF text extraction is lossy}, particularly for heavy mathematics; a systematically garbled equation can produce a spurious failure the agent may not detect. \emph{Self-reported confidence} is not yet validated calibration --- until the human-review arm produces curves, it should be read as a ranking signal, not a probability. \emph{Prompt-level honesty is soft}; it is why the artifact format, not the prompt, carries the trust burden.
+
+\section{Ethical Considerations}\label{sec:ethics}
+
+A public instrument that stamps \verdict{Not Reproduced} on named papers can harm reputations on the strength of an LLM's misreading. Three design choices mitigate this. First, the verdict taxonomy and gallery checklist frame failures as properties of the \emph{communication}, never as accusations of error or fraud --- ``the text underdetermines the result'' is the strongest claim the system can make. Second, every negative verdict ships with the complete evidence needed to contest it, and the stated protocol treats a successful rebuttal (a reader supplying the missing assumption that makes the method work) as a valuable outcome that upgrades the record. Third, agent-failure rates are reported alongside verdicts, and confidence values give authors and readers a graded signal rather than a binary stamp. The system's network posture is also deliberately polite: arXiv is accessed via its public APIs with retry backoff, PDFs are cached and never re-fetched per run, and the sandbox cannot generate traffic at all.
+
+\section{Conclusion}
+
+Reproduction is the part of science we all endorse and almost never fund. LLM agents make its marginal cost low enough to change the institution --- but only if the automation is engineered for distrust: of the papers it reads, of the code it writes, and above all of its own optimism. \system{} is a working, tested, open-source attempt at that engineering: text-only reproduction as the measured quantity, mechanical containment as the security posture, auditable workspaces as the unit of publication, calibrated three-valued verdicts as the interface, and dollars as a first-class output. The instrument is built; the survey begins now.
+
+\begin{thebibliography}{99}
+
+\bibitem{baker2016} M.~Baker. 1,500 scientists lift the lid on reproducibility. \emph{Nature}, 533(7604):452--454, 2016.
+
+\bibitem{osc2015} Open Science Collaboration. Estimating the reproducibility of psychological science. \emph{Science}, 349(6251):aac4716, 2015.
+
+\bibitem{errington2021} T.~M. Errington et al. Investigating the replicability of preclinical cancer biology. \emph{eLife}, 10:e71601, 2021.
+
+\bibitem{collberg2016} C.~Collberg and T.~A. Proebsting. Repeatability in computer systems research. \emph{Communications of the ACM}, 59(3):62--69, 2016.
+
+\bibitem{gundersen2018} O.~E. Gundersen and S.~Kjensmo. State of the art: Reproducibility in artificial intelligence. In \emph{AAAI}, 2018.
+
+\bibitem{pineau2021} J.~Pineau et al. Improving reproducibility in machine learning research (a report from the NeurIPS 2019 reproducibility program). \emph{Journal of Machine Learning Research}, 22(164), 2021.
+
+\bibitem{kapoor2023} S.~Kapoor and A.~Narayanan. Leakage and the reproducibility crisis in machine-learning-based science. \emph{Patterns}, 4(9), 2023.
+
+\bibitem{raff2019} E.~Raff. A step toward quantifying independently reproducible machine learning research. In \emph{NeurIPS}, 2019.
+
+\bibitem{siegel2024} Z.~S. Siegel, S.~Kapoor, et al. CORE-Bench: Fostering the credibility of published research through a computational reproducibility agent benchmark. \emph{arXiv:2409.11363}, 2024.
+
+\bibitem{bogin2024} B.~Bogin et al. SUPER: Evaluating agents on setting up and executing tasks from research repositories. In \emph{EMNLP}, 2024.
+
+\bibitem{huang2024} Q.~Huang, J.~Vora, P.~Liang, and J.~Leskovec. MLAgentBench: Evaluating language agents on machine learning experimentation. In \emph{ICML}, 2024.
+
+\bibitem{starace2025} G.~Starace et al. PaperBench: Evaluating AI's ability to replicate AI research. \emph{arXiv:2504.01848}, 2025.
+
+\bibitem{greshake2023} K.~Greshake, S.~Abdelnabi, S.~Mishra, C.~Endres, T.~Holz, and M.~Fritz. Not what you've signed up for: Compromising real-world LLM-integrated applications with indirect prompt injection. In \emph{AISec}, 2023.
+
+\end{thebibliography}
+
+\end{document}

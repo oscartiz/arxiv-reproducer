@@ -16,3 +16,14 @@ arxiv-repro.toml
 .env
 .coverage
 coverage.xml
+
+# LaTeX build artifacts (CI uploads the PDF as a workflow artifact)
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.toc
+paper/*.bbl
+paper/*.blg
+paper/*.fls
+paper/*.fdb_latexmk
+paper/main.pdf

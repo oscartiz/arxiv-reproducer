@@ -12,8 +12,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -r requirements-lock.txt
@@ -28,11 +28,28 @@ jobs:
     # rootfs, two-phase install, teardown).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: docker build -t arxiv-repro-sandbox:latest -f src/arxiv_reproducer/docker/sandbox.Dockerfile .
       - run: pip install -r requirements-lock.txt
       - run: pip install -e . --no-deps
       - run: pytest -q --run-docker -k RealDocker --no-cov
+
+  paper:
+    # Builds the paper PDF and publishes it as a workflow artifact, so the
+    # LaTeX source in paper/ is proven to compile on every change.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-latex-base texlive-latex-recommended texlive-latex-extra \
+            texlive-fonts-recommended
+      - run: make paper
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paper-pdf
+          path: paper/main.pdf
