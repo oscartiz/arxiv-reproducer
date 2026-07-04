@@ -2,7 +2,7 @@
 VENV ?= .venv/bin
 IMAGE ?= arxiv-repro-sandbox:latest
 
-.PHONY: help install test integration lint typecheck check build-image lock run
+.PHONY: help install test integration lint typecheck check build-image lock run paper
 
 help:
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -33,3 +33,11 @@ lock: ## Regenerate requirements-lock.txt (needs uv)
 
 run: ## Run a reproduction: make run PAPER=2301.12345
 	$(VENV)/arxiv-repro $(PAPER)
+
+paper: ## Build paper/main.pdf (tectonic if available, else pdflatex x2)
+	@if command -v tectonic >/dev/null 2>&1; then \
+		tectonic paper/main.tex; \
+	else \
+		cd paper && pdflatex -interaction=nonstopmode -halt-on-error main.tex \
+		&& pdflatex -interaction=nonstopmode -halt-on-error main.tex; \
+	fi
