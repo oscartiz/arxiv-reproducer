@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import httpx
@@ -220,6 +221,133 @@ class TestHappyPath:
         monkeypatch.setattr(cli_mod, "run_reproduction", fake_run)
         main(["hep-th/9901001", "--runs-dir", str(tmp_path / "runs")])
         assert seen["base"].name == "hep-th_9901001"  # no path separator in dir name
+
+
+class TestBatchMode:
+    """Several IDs (or --batch FILE) run headlessly into a verdict spreadsheet."""
+
+    def paper_for(self, arxiv_id, tmp_path):
+        pdf_path = tmp_path / "paper.pdf"
+        if not pdf_path.exists():
+            pdf_path.write_bytes(b"%PDF-fake")
+        return Paper(
+            arxiv_id=arxiv_id,
+            title=f"Paper {arxiv_id}",
+            abstract="An abstract.",
+            authors=["A. Author"],
+            full_text="Full text.",
+            pdf_path=pdf_path,
+        )
+
+    def manifest_writing_run(self, ran_ids):
+        def fake_run(paper, workdir, console):
+            ran_ids.append(paper.arxiv_id)
+            report = workdir / "REPORT.md"
+            report.write_text("## Verdict\n\nREPRODUCED\n\nConfidence: 80%\n")
+            (workdir / "run.json").write_text(
+                json.dumps(
+                    {
+                        "arxiv_id": paper.arxiv_id,
+                        "title": paper.title,
+                        "status": "completed",
+                        "verdict": "REPRODUCED",
+                        "confidence": 80,
+                        "estimated_cost_usd": 2.0,
+                        "error": None,
+                    }
+                )
+            )
+            return RunResult(report=report, status="completed")
+
+        return fake_run
+
+    def read_summary(self, runs_dir):
+        import csv
+
+        csv_files = sorted(runs_dir.glob("batch-*.csv"))
+        assert len(csv_files) == 1
+        with csv_files[0].open(newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    def test_two_ids_produce_summary_spreadsheet(
+        self, ready_environment, monkeypatch, tmp_path, capsys
+    ):
+        runs_dir = tmp_path / "runs"
+        ran = []
+        monkeypatch.setattr(
+            cli_mod, "fetch_paper", lambda i, b: self.paper_for(i, tmp_path)
+        )
+        monkeypatch.setattr(cli_mod, "run_reproduction", self.manifest_writing_run(ran))
+
+        main(["2301.11111", "2301.22222", "--runs-dir", str(runs_dir)])
+
+        assert ran == ["2301.11111", "2301.22222"]
+        rows = self.read_summary(runs_dir)
+        assert [r["arxiv_id"] for r in rows] == ["2301.11111", "2301.22222"]
+        assert rows[0]["verdict"] == "REPRODUCED"
+        assert rows[0]["confidence"] == "80"
+        assert sorted(runs_dir.glob("batch-*.md"))  # markdown twin exists
+        out = capsys.readouterr().out
+        assert "Batch summary" in out
+        assert "estimated cost $4.00" in out
+
+    def test_one_bad_paper_does_not_kill_the_batch(
+        self, ready_environment, monkeypatch, tmp_path, capsys
+    ):
+        runs_dir = tmp_path / "runs"
+        ran = []
+
+        def fetch(arxiv_id, base_dir):
+            if arxiv_id == "2301.22222":
+                raise httpx.ConnectError("no route to host")
+            return self.paper_for(arxiv_id, tmp_path)
+
+        monkeypatch.setattr(cli_mod, "fetch_paper", fetch)
+        monkeypatch.setattr(cli_mod, "run_reproduction", self.manifest_writing_run(ran))
+
+        main(["2301.11111", "2301.22222", "2301.33333", "--runs-dir", str(runs_dir)])
+
+        assert ran == ["2301.11111", "2301.33333"]  # batch continued past the failure
+        rows = self.read_summary(runs_dir)
+        assert rows[1]["status"] == "fetch_error"
+        assert "Network error" in rows[1]["error"]
+        # Normalize whitespace: rich wraps console lines at 80 columns.
+        out = " ".join(capsys.readouterr().out.split())
+        assert "continuing with the next paper" in out
+
+    def test_batch_with_no_completed_run_exits_nonzero(
+        self, ready_environment, monkeypatch, tmp_path, capsys
+    ):
+        def fetch(arxiv_id, base_dir):
+            raise httpx.ConnectError("offline")
+
+        monkeypatch.setattr(cli_mod, "fetch_paper", fetch)
+        with pytest.raises(SystemExit) as excinfo:
+            main(["2301.11111", "2301.22222", "--runs-dir", str(tmp_path / "runs")])
+        assert excinfo.value.code == 1
+        assert "No paper in the batch completed" in capsys.readouterr().out
+
+    def test_batch_file_merges_and_dedups_with_positional_ids(
+        self, ready_environment, monkeypatch, tmp_path
+    ):
+        runs_dir = tmp_path / "runs"
+        ids_file = tmp_path / "ids.txt"
+        ids_file.write_text("2301.11111  # duplicate of the positional\n2301.22222\n")
+        ran = []
+        monkeypatch.setattr(
+            cli_mod, "fetch_paper", lambda i, b: self.paper_for(i, tmp_path)
+        )
+        monkeypatch.setattr(cli_mod, "run_reproduction", self.manifest_writing_run(ran))
+
+        main(["2301.11111", "--batch", str(ids_file), "--runs-dir", str(runs_dir)])
+
+        assert ran == ["2301.11111", "2301.22222"]  # deduplicated, order kept
+
+    def test_missing_batch_file_is_a_clear_error(self, ready_environment, tmp_path, capsys):
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--batch", str(tmp_path / "nope.txt")])
+        assert excinfo.value.code == 2
+        assert "could not read batch file" in capsys.readouterr().out
 
 
 class TestCredentialDetection:
