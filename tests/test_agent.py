@@ -208,6 +208,27 @@ class TestRunReproduction:
         assert first_block["cache_control"] == {"type": "ephemeral"}
         assert paper.full_text in first_block["text"]
 
+    def test_extracted_paper_figures_are_listed_in_the_initial_message(self, fake_agent_env):
+        paper, workdir = fake_agent_env
+        figures_dir = workdir / "paper-figures"
+        figures_dir.mkdir()
+        (figures_dir / "page03-img01.png").write_bytes(b"\x89PNG")
+        (figures_dir / "page01-img01.png").write_bytes(b"\x89PNG")
+        run_reproduction(paper, workdir, Console(record=True, width=200))
+
+        text = FakeAnthropic.last_kwargs["messages"][0]["content"][0]["text"]
+        assert "paper-figures/page01-img01.png" in text
+        assert "paper-figures/page03-img01.png" in text
+        # Sorted listing, and always ahead of the (cached) paper text.
+        assert text.index("page01-img01") < text.index("page03-img01")
+        assert text.index("page03-img01") < text.index(paper.full_text)
+
+    def test_no_figures_means_no_figures_note(self, fake_agent_env):
+        paper, workdir = fake_agent_env
+        run_reproduction(paper, workdir, Console(record=True, width=200))
+        text = FakeAnthropic.last_kwargs["messages"][0]["content"][0]["text"]
+        assert "paper-figures" not in text
+
     def test_streams_text_and_tool_use_to_console(self, fake_agent_env):
         paper, workdir = fake_agent_env
         FakeAnthropic.messages_to_yield = [
