@@ -1,11 +1,21 @@
+import os
+
 import pytest
 
+from arxiv_reproducer import config as config_module
 from arxiv_reproducer.config import set_config
 
 
 @pytest.fixture(autouse=True)
-def fresh_config():
-    """Each test sees a freshly-loaded config (env changes take effect)."""
+def fresh_config(monkeypatch, tmp_path):
+    """Each test sees a freshly-loaded config (env changes take effect),
+    isolated from the developer's ./arxiv-repro.toml and ARXIV_REPRO_* env vars."""
+    for key in list(os.environ):
+        if key.startswith(config_module.ENV_PREFIX):
+            monkeypatch.delenv(key)
+    monkeypatch.setattr(
+        config_module, "DEFAULT_CONFIG_FILENAME", str(tmp_path / "absent-config.toml")
+    )
     set_config(None)
     yield
     set_config(None)
