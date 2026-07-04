@@ -61,7 +61,7 @@ The resulting `REPORT.md` contains:
 | **Method Summary** | The paper's method as the agent understood it |
 | **Implementation Notes** | Every assumption made where the paper was ambiguous — this is often the most scientifically interesting section |
 | **Results Comparison** | Paper-reported vs. reproduced values, with relative errors |
-| **Figures** | Regenerated plots saved as PNGs in the workspace |
+| **Figures** | Regenerated plots beside the paper's originals (extracted from the PDF into `paper-figures/`), with a stated comparison |
 | **Verdict** | `REPRODUCED` / `PARTIALLY REPRODUCED` / `NOT REPRODUCED`, with justification and a calibrated `Confidence: NN%` |
 | **Run metadata** | Status, model, iterations, wall clock, token counts, estimated cost — appended automatically |
 
@@ -74,6 +74,7 @@ runs/2301.12345/
 ├── paper.pdf                # download cache, shared across runs
 ├── 20260703-142205/         # one workspace per run
 │   ├── paper.pdf            # in-workspace copy, so auditors see what the agent saw
+│   ├── paper-figures/       # the paper's own figures, extracted from the PDF
 │   ├── simulate.py, …       # every script the agent wrote
 │   ├── figure3.png, …       # every figure it generated
 │   ├── REPORT.md
@@ -193,6 +194,7 @@ Every key is documented in [`arxiv-repro.example.toml`](arxiv-repro.example.toml
 arxiv-reproducer/
 ├── src/arxiv_reproducer/
 │   ├── paper.py             # arXiv API + PDF extraction, retried, scan-refusing
+│   ├── figures.py           # best-effort extraction of the paper's own figures
 │   ├── agent.py             # Claude tool-use loop, tool definitions, run manifest
 │   ├── prompts.py           # system prompt: workflow + honesty rules
 │   ├── sandbox.py           # container lifecycle, hardening, two-phase installs
@@ -273,7 +275,7 @@ Poor candidates: anything needing proprietary data, large-scale training, or phy
 ## Roadmap
 
 - [ ] **Reproduction gallery** — reports for 5+ papers, committed under `examples/`
-- [ ] **Figure-to-figure comparison** — extract the paper's original figures from the PDF and render them beside the regenerated ones in the report
+- [x] **Figure-to-figure comparison** — the paper's own figures are extracted from the PDF into `paper-figures/` and embedded beside the regenerated ones in the report
 - [x] **Cost & token accounting** — per-run usage summary (input/output/cache-read tokens, dollar estimate)
 - [x] **Batch screening mode** — several IDs and/or `--batch ids.txt` run back-to-back, surviving per-paper failures, into a verdict/confidence/cost spreadsheet (CSV + markdown)
 - [x] **Calibrated verdicts** — every verdict carries an agent-stated `Confidence: NN%`, extracted into `run.json`; measuring calibration against human review awaits the gallery

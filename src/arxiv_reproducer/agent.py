@@ -142,6 +142,11 @@ def run_reproduction(paper: Paper, workdir: Path, console: Console) -> RunResult
     started_at = datetime.now(timezone.utc)
     logger.info("run starting: arxiv_id=%s model=%s", paper.arxiv_id, cfg.model)
 
+    figures_dir = workdir / "paper-figures"
+    figure_files = (
+        sorted(path.name for path in figures_dir.glob("*.png")) if figures_dir.is_dir() else []
+    )
+
     with DockerSandbox(workdir) as sandbox:
         runner = client.beta.messages.tool_runner(
             model=cfg.model,
@@ -156,7 +161,7 @@ def run_reproduction(paper: Paper, workdir: Path, console: Console) -> RunResult
                         {
                             "type": "text",
                             "text": initial_user_message(
-                                paper.title, paper.arxiv_id, paper.full_text
+                                paper.title, paper.arxiv_id, paper.full_text, figure_files
                             ),
                             # The paper text is resent on every loop iteration;
                             # caching it cuts cost and latency substantially.

@@ -17,6 +17,7 @@ from rich.table import Table
 from .agent import run_reproduction
 from .batch import BatchRow, read_id_file, summarize, write_summary_csv, write_summary_md
 from .config import ConfigError, get_config
+from .figures import extract_paper_figures
 from .logs import setup_logging
 from .paper import Paper, PdfExtractionError, fetch_paper, parse_arxiv_id
 from .runs import new_run_dir, safe_dir_name
@@ -73,6 +74,12 @@ def _prepare(paper_arg: str, runs_dir: Path, console: Console) -> tuple[Paper, P
     # Fresh timestamped workspace per run: prior reports are never clobbered.
     workdir = new_run_dir(base_dir)
     shutil.copy2(paper.pdf_path, workdir / "paper.pdf")
+    figures = extract_paper_figures(workdir / "paper.pdf", workdir / "paper-figures")
+    if figures:
+        console.print(
+            f"[dim]Extracted {len(figures)} original figure(s) from the PDF "
+            f"→ paper-figures/[/dim]"
+        )
     return paper, workdir
 
 

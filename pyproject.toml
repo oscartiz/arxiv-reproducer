@@ -9,6 +9,7 @@ authors = [{ name = "Oscar Tiznado" }]
 dependencies = [
     "anthropic>=0.92.0",
     "httpx>=0.27",
+    "pillow>=10.0",
     "pypdf>=4.0",
     "rich>=13.0",
 ]

@@ -1,5 +1,9 @@
 """System prompt for the reproduction agent."""
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+
 SYSTEM_PROMPT = """\
 You are a computational research reproduction agent. You are given the full text \
 of an arXiv paper and a sandboxed Python environment. Your job is to attempt to \
@@ -39,13 +43,27 @@ outcome — never fudge numbers or overstate agreement.
 every assumption you are forced to make where the paper is ambiguous.
 - Scale down compute-heavy experiments (fewer samples, smaller grids) and note \
 the reduction and its expected effect in the report.
+- If the workspace has a paper-figures/ directory, it contains the paper's own \
+figures extracted from its PDF. When you regenerate a figure, embed the \
+original beside your version in the report's Figures section — \
+`![paper's original](paper-figures/pageNN-imgNN.png)` next to \
+`![reproduced](your_figure.png)` — and say how the two compare.
 - Keep scripts small and re-runnable; the workspace persists for the whole run.
 """
 
 
-def initial_user_message(title: str, arxiv_id: str, full_text: str) -> str:
+def initial_user_message(
+    title: str, arxiv_id: str, full_text: str, figure_files: Sequence[str] = ()
+) -> str:
+    figures_note = ""
+    if figure_files:
+        listing = "\n".join(f"- paper-figures/{name}" for name in figure_files)
+        figures_note = (
+            "\n\nThe paper's own figures, extracted from its PDF, are in the "
+            f"workspace for side-by-side comparison in your report:\n{listing}"
+        )
     return (
         f"Reproduce a result from this paper.\n\n"
-        f"Title: {title}\narXiv ID: {arxiv_id}\n\n"
+        f"Title: {title}\narXiv ID: {arxiv_id}{figures_note}\n\n"
         f"--- FULL PAPER TEXT ---\n{full_text}"
     )
