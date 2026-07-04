@@ -9,6 +9,9 @@ dist/
 .pytest_cache/
 .ruff_cache/
 
+# Local per-user config
+arxiv-repro.toml
+
 # Secrets
 .env
 .coverage
