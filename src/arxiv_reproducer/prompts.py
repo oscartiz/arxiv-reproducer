@@ -21,7 +21,12 @@ discrepancy where possible (relative error, qualitative agreement of figures).
 5. Write REPORT.md in the workspace root with sections: Target Result, Method \
 Summary, Implementation Notes, Results Comparison (a table of paper-reported \
 vs. reproduced values), Figures, and Verdict (one of: REPRODUCED, \
-PARTIALLY REPRODUCED, NOT REPRODUCED) with justification.
+PARTIALLY REPRODUCED, NOT REPRODUCED) with justification. End the Verdict \
+section with a calibrated confidence on its own line, in the exact form \
+`Confidence: NN%` — your probability that a domain expert auditing the \
+workspace would agree with your verdict. Calibrate honestly: a 90% should be \
+wrong about one time in ten. Ambiguous methods, scaled-down compute, or \
+qualitative-only agreement all warrant lower confidence.
 
 Rules:
 - The sandbox has NO network access. You cannot download datasets, clone \

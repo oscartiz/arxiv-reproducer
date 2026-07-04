@@ -310,7 +310,7 @@ class TestAccountingAndManifest:
         ]
         (workdir / "REPORT.md").write_text(
             "# Report\n\n## Target Result\n\nTc = 2.269 for the 2D Ising model.\n\n"
-            "## Verdict\n\nPARTIALLY REPRODUCED\n"
+            "## Verdict\n\nPARTIALLY REPRODUCED\n\nConfidence: 70%\n"
         )
         result = run_reproduction(paper, workdir, Console(record=True, width=200))
 
@@ -325,6 +325,7 @@ class TestAccountingAndManifest:
         assert manifest["model"] == get_config().model
         assert manifest["status"] == "completed"
         assert manifest["verdict"] == "PARTIALLY REPRODUCED"
+        assert manifest["confidence"] == 70
         assert manifest["target_result"].startswith("Tc = 2.269")
         assert manifest["tokens"]["input_tokens"] == 1500
         assert manifest["estimated_cost_usd"] == result.estimated_cost_usd

@@ -15,6 +15,9 @@ SCHEMA_VERSION = 1
 # Order matters: the qualified verdicts contain the bare word REPRODUCED.
 _VERDICTS = ("PARTIALLY REPRODUCED", "NOT REPRODUCED", "REPRODUCED")
 
+# The prompt asks for exactly `Confidence: NN%` on its own line.
+_CONFIDENCE_RE = re.compile(r"^\s*Confidence:\s*(\d{1,3})\s*%", re.IGNORECASE | re.MULTILINE)
+
 
 def verdict_from_report(report_text: str) -> str | None:
     """Best-effort extraction of the agent's verdict from REPORT.md."""
@@ -22,6 +25,15 @@ def verdict_from_report(report_text: str) -> str | None:
         if re.search(rf"\b{verdict}\b", report_text):
             return verdict
     return None
+
+
+def confidence_from_report(report_text: str) -> int | None:
+    """The agent's calibrated confidence (0–100), or None if absent/malformed."""
+    match = _CONFIDENCE_RE.search(report_text)
+    if match is None:
+        return None
+    value = int(match.group(1))
+    return value if value <= 100 else None
 
 
 def section_snippet(report_text: str, heading: str, max_chars: int = 300) -> str | None:
