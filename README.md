@@ -62,7 +62,7 @@ The resulting `REPORT.md` contains:
 | **Implementation Notes** | Every assumption made where the paper was ambiguous — this is often the most scientifically interesting section |
 | **Results Comparison** | Paper-reported vs. reproduced values, with relative errors |
 | **Figures** | Regenerated plots saved as PNGs in the workspace |
-| **Verdict** | `REPRODUCED` / `PARTIALLY REPRODUCED` / `NOT REPRODUCED`, with justification |
+| **Verdict** | `REPRODUCED` / `PARTIALLY REPRODUCED` / `NOT REPRODUCED`, with justification and a calibrated `Confidence: NN%` |
 | **Run metadata** | Status, model, iterations, wall clock, token counts, estimated cost — appended automatically |
 
 ### What a run leaves behind
@@ -81,7 +81,7 @@ runs/2301.12345/
 └── latest → 20260703-142205
 ```
 
-`run.json` records the arXiv ID, title, model, status, extracted verdict, target result, iteration count, wall clock, per-category token totals, estimated cost, installed packages, and start/finish timestamps — so batches of runs are queryable in aggregate:
+`run.json` records the arXiv ID, title, model, status, extracted verdict and confidence, target result, iteration count, wall clock, per-category token totals, estimated cost, installed packages, and start/finish timestamps — so batches of runs are queryable in aggregate:
 
 ```bash
 jq -r '[.arxiv_id, .verdict, .status, .estimated_cost_usd] | @tsv' runs/*/latest/run.json
@@ -268,7 +268,7 @@ Poor candidates: anything needing proprietary data, large-scale training, or phy
 - [ ] **Figure-to-figure comparison** — extract the paper's original figures from the PDF and render them beside the regenerated ones in the report
 - [x] **Cost & token accounting** — per-run usage summary (input/output/cache-read tokens, dollar estimate)
 - [ ] **Batch screening mode** — headless runs over a list of IDs, producing a feasibility/verdict spreadsheet
-- [ ] **Calibrated verdicts** — have the agent attach a confidence to its verdict, then measure calibration against human review
+- [x] **Calibrated verdicts** — every verdict carries an agent-stated `Confidence: NN%`, extracted into `run.json`; measuring calibration against human review awaits the gallery
 - [x] **Network-isolated execution** — pre-bake a scientific-stack image so the container can run with `--network none` after setup
 
 ## Development

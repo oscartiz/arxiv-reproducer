@@ -4,6 +4,7 @@ import pytest
 
 from arxiv_reproducer.manifest import (
     SCHEMA_VERSION,
+    confidence_from_report,
     section_snippet,
     verdict_from_report,
     write_manifest,
@@ -28,6 +29,26 @@ class TestVerdictExtraction:
 
     def test_lowercase_prose_does_not_count(self):
         assert verdict_from_report("we have not reproduced anything") is None
+
+
+class TestConfidenceExtraction:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("## Verdict\n\nREPRODUCED\n\nConfidence: 85%\n", 85),
+            ("Confidence: 100%", 100),
+            ("Confidence: 0%", 0),
+            ("  confidence: 42 %\n", 42),  # indented, lowercase, spaced
+            ("## Verdict\n\nREPRODUCED, no confidence stated.", None),
+            ("Confidence: 250%", None),  # not a probability
+            ("Confidence: high", None),  # not numeric
+        ],
+    )
+    def test_extracts_valid_confidence(self, text, expected):
+        assert confidence_from_report(text) == expected
+
+    def test_mid_line_mention_does_not_count(self):
+        assert confidence_from_report("We report Confidence: 90% here.") is None
 
 
 class TestSectionSnippet:

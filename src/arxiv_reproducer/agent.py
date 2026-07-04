@@ -16,7 +16,12 @@ from rich.console import Console
 from .config import get_config
 from .costs import Usage, estimate_cost_usd
 from .logs import get_logger
-from .manifest import section_snippet, verdict_from_report, write_manifest
+from .manifest import (
+    confidence_from_report,
+    section_snippet,
+    verdict_from_report,
+    write_manifest,
+)
 from .paper import Paper
 from .prompts import SYSTEM_PROMPT, initial_user_message
 from .sandbox import DockerSandbox
@@ -220,6 +225,7 @@ def run_reproduction(paper: Paper, workdir: Path, console: Console) -> RunResult
             "status": status,
             "error": error,
             "verdict": verdict_from_report(report_text),
+            "confidence": confidence_from_report(report_text),
             "target_result": section_snippet(report_text, "Target Result"),
             "iterations": iterations,
             "wall_clock_seconds": round(wall_clock, 1),
