@@ -202,7 +202,8 @@ arxiv-reproducer/
 │   ├── runs.py              # timestamped, non-clobbering run directories
 │   ├── retry.py             # exponential backoff for transient HTTP failures
 │   ├── logs.py              # structured logging (plain or JSON lines)
-│   ├── cli.py               # arxiv-repro entry point
+│   ├── batch.py             # batch screening: many IDs → verdict spreadsheet
+│   ├── cli.py               # arxiv-repro entry point, single-run + batch modes
 │   └── docker/
 │       └── sandbox.Dockerfile   # pre-baked scientific image, digest-pinned base
 ├── tests/                   # full suite runs with no Docker and no API key
@@ -231,6 +232,13 @@ export ANTHROPIC_API_KEY=sk-ant-...    # or `ant auth login`
 .venv/bin/arxiv-repro 2301.12345
 .venv/bin/arxiv-repro https://arxiv.org/abs/2301.12345   # URLs work too
 .venv/bin/arxiv-repro hep-th/9901001                     # old-style IDs work too
+
+# Batch screening: several IDs, or a file of them (one per line, # comments OK)
+.venv/bin/arxiv-repro 2301.12345 2405.00001
+.venv/bin/arxiv-repro --batch papers.txt
+# → per-paper workspaces as usual, plus runs/batch-<timestamp>.csv and .md —
+#   one row per paper: verdict, confidence, status, target result, cost.
+#   A paper that fails to fetch becomes a row, not a dead batch.
 ```
 
 The first real run builds the sandbox image, which takes a few minutes; after that, container start is instant. `make build-image` builds it ahead of time.
@@ -267,7 +275,7 @@ Poor candidates: anything needing proprietary data, large-scale training, or phy
 - [ ] **Reproduction gallery** — reports for 5+ papers, committed under `examples/`
 - [ ] **Figure-to-figure comparison** — extract the paper's original figures from the PDF and render them beside the regenerated ones in the report
 - [x] **Cost & token accounting** — per-run usage summary (input/output/cache-read tokens, dollar estimate)
-- [ ] **Batch screening mode** — headless runs over a list of IDs, producing a feasibility/verdict spreadsheet
+- [x] **Batch screening mode** — several IDs and/or `--batch ids.txt` run back-to-back, surviving per-paper failures, into a verdict/confidence/cost spreadsheet (CSV + markdown)
 - [x] **Calibrated verdicts** — every verdict carries an agent-stated `Confidence: NN%`, extracted into `run.json`; measuring calibration against human review awaits the gallery
 - [x] **Network-isolated execution** — pre-bake a scientific-stack image so the container can run with `--network none` after setup
 
